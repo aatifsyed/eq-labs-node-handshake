@@ -3,12 +3,9 @@
 // like [impl_parse_deparse_each_field].
 // I didn't want to write a procedural macro just for that, so we use these two traits, and use the
 // decl macro to implement for our business structs.
-pub trait Parse<'a>: Sized {
-    fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self>;
+pub trait Parse<InputSliceT: nom_derive::InputSlice>: Sized {
+    fn parse(buffer: InputSliceT) -> nom::IResult<InputSliceT, Self>;
 }
-
-pub trait ParseOwned: for<'a> Parse<'a> {}
-impl<T: for<'a> Parse<'a>> ParseOwned for T {}
 
 pub trait Deparse {
     /// The size of buffer required to deparse this struct (including all fields)
@@ -21,7 +18,7 @@ pub trait Deparse {
 macro_rules! impl_parse_deparse_each_field {
     (
         $(#[$struct_meta:meta])*
-        $struct_vis:vis struct $struct_name:ident$(<$lifetime:lifetime>)? {
+        $struct_vis:vis struct $struct_name:ident {
             $(
                 $(#[$field_meta:meta])*
                 $field_vis:vis $field_name:ident: $field_ty:ty,
@@ -29,20 +26,18 @@ macro_rules! impl_parse_deparse_each_field {
         }
     ) => {
         $(#[$struct_meta])*
-        $struct_vis struct $struct_name$(<$lifetime>)? {
+        $struct_vis struct $struct_name {
             $(
                 $(#[$field_meta])*
                 $field_vis $field_name: $field_ty,
             )*
         }
-        impl<'a, $($lifetime,)?> $crate::Parse<'a> for $struct_name$(<$lifetime>)?
-        // shenanigans to allow the same macro to be used for borrowed fields
-        $(where $lifetime: 'a, 'a: $lifetime)?
+        impl<InputSliceT: nom_derive::InputSlice + Clone> $crate::Parse<InputSliceT> for $struct_name
         {
-            fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+            fn parse(buffer: InputSliceT) -> nom::IResult<InputSliceT, Self> {
                 let rem = buffer;
                 $(
-                    let (rem, $field_name) = <$field_ty as $crate::Parse>::parse(rem)?;
+                    let (rem, $field_name) = <$field_ty as $crate::Parse<InputSliceT>>::parse(rem)?;
                 )*
                 Ok((rem, Self {
                     $(
@@ -51,7 +46,7 @@ macro_rules! impl_parse_deparse_each_field {
                 }))
             }
         }
-        impl$(<$lifetime>)? $crate::Deparse for $struct_name$(<$lifetime>)? {
+        impl $crate::Deparse for $struct_name {
             fn deparsed_len(&self) -> usize {
                 [
                     $(
@@ -71,8 +66,12 @@ macro_rules! impl_parse_deparse_each_field {
     };
 }
 
-impl<'a> Parse<'a> for std::borrow::Cow<'a, str> {
-    fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+impl<'a, InputSliceT: nom_derive::InputSlice> Parse<InputSliceT> for std::borrow::Cow<'a, str>
+where
+    nom::error::Error<InputSliceT>: nom::error::FromExternalError<&'a [u8], std::str::Utf8Error>,
+    nom::error::Error<InputSliceT>: nom::error::ParseError<&'a [u8]>,
+{
+    fn parse(buffer: InputSliceT) -> nom::IResult<InputSliceT, Self> {
         let (rem, length) = VarInt::parse(buffer)?;
         let (rem, s) = nom::combinator::map_res(
             // should fail to compile on 32-bit platforms, as nom::traits::ToUsize isn't implemented for u64 on those platforms
@@ -114,8 +113,8 @@ impl_parse_deparse_each_field!(
 macro_rules! impl_parse_deparse_via_le_bytes {
     ($($nom_parser:path => $ty:ty),* $(,)?) => {
         $(
-            impl $crate::Parse<'_> for $ty {
-                fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+            impl<InputSliceT: nom_derive::InputSlice> $crate::Parse<InputSliceT> for $ty {
+                fn parse(buffer: InputSliceT) -> nom::IResult<InputSliceT, Self> {
                     $nom_parser(buffer)
                 }
             }
@@ -141,11 +140,11 @@ impl_parse_deparse_via_le_bytes!(
     nom::number::streaming::le_u64 => u64,
 );
 
-impl<'a, const N: usize, T> Parse<'a> for [T; N]
+impl<const N: usize, InputSliceT: nom_derive::InputSlice + Clone, T> Parse<InputSliceT> for [T; N]
 where
-    T: Parse<'a>,
+    T: Parse<InputSliceT>,
 {
-    fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+    fn parse(buffer: InputSliceT) -> nom::IResult<InputSliceT, Self> {
         use nom::{
             combinator::{complete, map_res},
             multi::many_m_n,
@@ -177,8 +176,8 @@ impl From<usize> for VarInt {
     }
 }
 
-impl Parse<'_> for VarInt {
-    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+impl<InputSliceT: nom_derive::InputSlice> Parse<InputSliceT> for VarInt {
+    fn parse(buffer: InputSliceT) -> nom::IResult<InputSliceT, Self> {
         use tap::Pipe as _;
         let (rem, inner) = {
             let (rem, first_byte) = u8::parse(buffer)?;
@@ -225,8 +224,12 @@ impl Deparse for VarInt {
     }
 }
 
-impl Parse<'_> for String {
-    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+impl<InputSliceT: nom_derive::InputSlice> Parse<InputSliceT> for String
+where
+    nom::error::Error<InputSliceT>: nom::error::FromExternalError<InputSliceT, std::str::Utf8Error>,
+    nom::error::Error<InputSliceT>: nom::error::FromExternalError<InputSliceT, std::str::Utf8Error>,
+{
+    fn parse(buffer: InputSliceT) -> nom::IResult<InputSliceT, Self> {
         let (rem, length) = VarInt::parse(buffer)?;
         let (rem, s) = nom::combinator::map_res(
             // should fail to compile on 32-bit platforms, as nom::traits::ToUsize isn't implemented for u64 on those platforms
@@ -250,13 +253,15 @@ impl Deparse for String {
     }
 }
 
-impl<'a, T> Parse<'a> for bitbag::BitBag<T>
+impl<InputSliceT: nom_derive::InputSlice, BitBaggableT> Parse<InputSliceT>
+    for bitbag::BitBag<BitBaggableT>
 where
-    T: bitbag::BitBaggable,
-    T::Repr: Parse<'a>,
+    BitBaggableT: bitbag::BitBaggable,
+    BitBaggableT::Repr: Parse<InputSliceT>,
 {
-    fn parse(buffer: &'a [u8]) -> nom::IResult<&[u8], Self> {
-        T::Repr::parse(buffer).map(|(rem, repr)| (rem, bitbag::BitBag::new_unchecked(repr)))
+    fn parse(buffer: InputSliceT) -> nom::IResult<InputSliceT, Self> {
+        BitBaggableT::Repr::parse(buffer)
+            .map(|(rem, repr)| (rem, bitbag::BitBag::new_unchecked(repr)))
     }
 }
 
@@ -274,8 +279,8 @@ where
     }
 }
 
-impl Parse<'_> for chrono::NaiveDateTime {
-    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+impl<InputSliceT: nom_derive::InputSlice + Clone> Parse<InputSliceT> for chrono::NaiveDateTime {
+    fn parse(buffer: InputSliceT) -> nom::IResult<InputSliceT, Self> {
         let (rem, timestamp) = nom::combinator::map_res(u64::parse, i64::try_from)(buffer)?;
         let timestamp = chrono::NaiveDateTime::from_timestamp_opt(timestamp.into(), 0).ok_or(
             nom::Err::Error(nom::error::make_error(
@@ -297,8 +302,8 @@ impl Deparse for chrono::NaiveDateTime {
     }
 }
 
-impl Parse<'_> for bool {
-    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+impl<InputSliceT: nom_derive::InputSlice> Parse<InputSliceT> for bool {
+    fn parse(buffer: InputSliceT) -> nom::IResult<InputSliceT, Self> {
         let (rem, byte) = u8::parse(buffer)?;
         match byte {
             1 => Ok((rem, true)),
@@ -332,8 +337,8 @@ pub struct NetworkAddressWithoutTime {
     pub port: u16,
 }
 
-impl Parse<'_> for NetworkAddressWithoutTime {
-    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+impl<InputSliceT: nom_derive::InputSlice> Parse<InputSliceT> for NetworkAddressWithoutTime {
+    fn parse(buffer: InputSliceT) -> nom::IResult<InputSliceT, Self> {
         let (rem, services) = Parse::parse(buffer)?;
         let (rem, ipv6) = nom::number::streaming::be_u128(rem)?;
         let (rem, port) = nom::number::streaming::be_u16(rem)?;
@@ -440,8 +445,8 @@ pub enum Version {
     },
 }
 
-impl Parse<'_> for Version {
-    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+impl<InputSliceT: nom_derive::InputSlice + Clone> Parse<InputSliceT> for Version {
+    fn parse(buffer: InputSliceT) -> nom::IResult<InputSliceT, Self> {
         let (rem, version) = u32::parse(buffer)?;
         match version {
             ..=105 => {
@@ -622,7 +627,7 @@ mod tests {
 
     fn do_test<'a, T>(example_bin: impl IntoIterator<Item = &'a str>, expected: T)
     where
-        for<'b> T: Parse<'b>,
+        for<'b> T: Parse<&'b [u8]>,
         T: Deparse + PartialEq + std::fmt::Debug,
     {
         use pretty_assertions::assert_eq;
