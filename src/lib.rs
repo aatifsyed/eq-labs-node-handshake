@@ -21,7 +21,7 @@ pub trait Deparse {
 macro_rules! impl_parse_deparse_each_field {
     (
         $(#[$struct_meta:meta])*
-        $struct_vis:vis struct $struct_ident:ident$(<$generics:tt>)? {
+        $struct_vis:vis struct $struct_name:ident$(<$lifetime:lifetime>)? {
             $(
                 $(#[$field_meta:meta])*
                 $field_vis:vis $field_name:ident: $field_ty:ty,
@@ -29,13 +29,16 @@ macro_rules! impl_parse_deparse_each_field {
         }
     ) => {
         $(#[$struct_meta])*
-        $struct_vis struct $struct_ident$(<$generics>)? {
+        $struct_vis struct $struct_name$(<$lifetime>)? {
             $(
                 $(#[$field_meta])*
                 $field_vis $field_name: $field_ty,
             )*
         }
-        impl<'a, $($generics)?> $crate::Parse<'a> for $struct_ident$(<$generics>)? {
+        impl<'a, $($lifetime,)?> $crate::Parse<'a> for $struct_name$(<$lifetime>)?
+        // shenanigans to allow the same macro to be used for borrowed fields
+        $(where $lifetime: 'a, 'a: $lifetime)?
+        {
             fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
                 let rem = buffer;
                 $(
@@ -48,7 +51,7 @@ macro_rules! impl_parse_deparse_each_field {
                 }))
             }
         }
-        impl$(<$generics>)? $crate::Deparse for $struct_ident$(<$generics>)? {
+        impl$(<$lifetime>)? $crate::Deparse for $struct_name$(<$lifetime>)? {
             fn deparsed_len(&self) -> usize {
                 [
                     $(
@@ -66,6 +69,31 @@ macro_rules! impl_parse_deparse_each_field {
             }
         }
     };
+}
+
+impl<'a> Parse<'a> for std::borrow::Cow<'a, str> {
+    fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+        let (rem, length) = VarInt::parse(buffer)?;
+        let (rem, s) = nom::combinator::map_res(
+            // should fail to compile on 32-bit platforms, as nom::traits::ToUsize isn't implemented for u64 on those platforms
+            // so we should be arithmetically safe
+            nom::bytes::streaming::take(length.inner),
+            std::str::from_utf8,
+        )(rem)?;
+        Ok((rem, Self::Borrowed(s)))
+    }
+}
+
+impl Deparse for std::borrow::Cow<'_, str> {
+    fn deparsed_len(&self) -> usize {
+        VarInt::from(self.len()).deparsed_len() + self.len()
+    }
+
+    fn deparse(&self, buffer: &mut [u8]) {
+        let len = VarInt::from(self.len());
+        len.deparse(buffer);
+        frontfill(self.as_bytes(), &mut buffer[len.deparsed_len()..]);
+    }
 }
 
 impl_parse_deparse_each_field!(
@@ -87,7 +115,7 @@ macro_rules! impl_parse_deparse_via_le_bytes {
     ($($nom_parser:path => $ty:ty),* $(,)?) => {
         $(
             impl $crate::Parse<'_> for $ty {
-                fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+                fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
                     $nom_parser(buffer)
                 }
             }
@@ -150,7 +178,7 @@ impl From<usize> for VarInt {
 }
 
 impl Parse<'_> for VarInt {
-    fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
         use tap::Pipe as _;
         let (rem, inner) = {
             let (rem, first_byte) = u8::parse(buffer)?;
@@ -224,10 +252,10 @@ impl Deparse for String {
 
 impl<'a, T> Parse<'a> for bitbag::BitBag<T>
 where
-    T: bitbag::BitBaggable + 'a,
+    T: bitbag::BitBaggable,
     T::Repr: Parse<'a>,
 {
-    fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+    fn parse(buffer: &'a [u8]) -> nom::IResult<&[u8], Self> {
         T::Repr::parse(buffer).map(|(rem, repr)| (rem, bitbag::BitBag::new_unchecked(repr)))
     }
 }
@@ -647,7 +675,8 @@ mod tests {
         do_test(
             ["0F 2F 53 61 74 6F 73 68 69 3A 30 2E 37 2E 32 2F"],
             String::from("/Satoshi:0.7.2/"),
-        )
+        );
+        do_test(["00"], String::from(""));
     }
 
     #[test]

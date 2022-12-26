@@ -4,7 +4,7 @@ use clap::Parser;
 use color_eyre::eyre::Context;
 use eq_labs_node_handshake::{
     constants::Magic, Deparse, Header, NetworkAddressWithoutTime, Version, VersionFields106,
-    VersionFieldsMandatory,
+    VersionFields70001, VersionFieldsMandatory,
 };
 use tracing::info;
 
@@ -27,11 +27,11 @@ fn main() -> color_eyre::Result<()> {
             let mut socket = std::net::TcpStream::connect(destination)
                 .wrap_err("couldn't connect to destination")?;
 
-            let body = Version::Supports106 {
-                version: 70000.try_into().unwrap(),
+            let body = Version::Supports70001 {
+                version: 70001.try_into().unwrap(),
                 fields: VersionFieldsMandatory {
                     services: Default::default(),
-                    timestamp: chrono::Utc::now().naive_utc(),
+                    timestamp: Default::default(),
                     receiver: NetworkAddressWithoutTime {
                         services: Default::default(),
                         ipv6: match destination.ip() {
@@ -44,37 +44,37 @@ fn main() -> color_eyre::Result<()> {
                 fields_106: VersionFields106 {
                     sender: NetworkAddressWithoutTime {
                         services: Default::default(),
-                        ipv6: std::net::Ipv6Addr::UNSPECIFIED,
+                        ipv6: std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(),
                         port: Default::default(),
                     },
-                    nonce: 42069,
-                    user_agent: String::from("user-agent"),
+                    nonce: 07_777_777_777_777_777_777u64,
+                    user_agent: todo!(),
                     start_height: 0,
                 },
+                fields_70001: VersionFields70001 { relay: false },
             };
 
             let mut buf = vec![0u8; std::mem::size_of::<Header>() + body.deparsed_len()];
 
             body.deparse(&mut buf[std::mem::size_of::<Header>()..]);
-            let checksum = sha256::digest(&buf[std::mem::size_of::<Header>()..])
-                .as_bytes()
-                .chunks(4)
-                .map(|c| [c[0], c[1], c[2], c[3]])
-                .next()
-                .unwrap();
 
+            let checksum = <bitcoin_hashes::sha256d::Hash as bitcoin_hashes::Hash>::hash(
+                &buf[std::mem::size_of::<Header>()..],
+            );
             let header = Header {
                 magic: Magic::Main as _,
                 command: *b"version\0\0\0\0\0",
                 length: body.deparsed_len().try_into().unwrap(),
-                checksum,
+                checksum: [checksum[0], checksum[1], checksum[2], checksum[3]],
             };
 
             header.deparse(&mut buf);
 
+            println!("{buf:x?}");
+
             socket.write_all(&buf).wrap_err("couldn't send version")?;
 
-            let mut buf = [0; 24];
+            let mut buf = [0; 100];
             socket.read(&mut buf).wrap_err("couldn't read verack")?;
             println!("{buf:x?}");
             Ok(())
