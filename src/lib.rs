@@ -1,3 +1,5 @@
+pub mod deparse;
+
 use std::borrow::Cow;
 
 #[derive(Debug, Clone, PartialEq, Hash)]
