@@ -3,8 +3,8 @@ use std::io::{Read, Write};
 use clap::Parser;
 use color_eyre::eyre::Context;
 use eq_labs_node_handshake::{
-    constants::Magic, Deparse, Header, NetworkAddressWithoutTime, Version, VersionFields106,
-    VersionFields70001, VersionFieldsMandatory,
+    constants::Magic, Deparse, Message, MessageBody, NetworkAddressWithoutTime, Parse, Version,
+    VersionFields106, VersionFields70001, VersionFieldsMandatory,
 };
 use tracing::info;
 
@@ -27,56 +27,45 @@ fn main() -> color_eyre::Result<()> {
             let mut socket = std::net::TcpStream::connect(destination)
                 .wrap_err("couldn't connect to destination")?;
 
-            let body = Version::Supports70001 {
-                version: 70001.try_into().unwrap(),
-                fields: VersionFieldsMandatory {
-                    services: Default::default(),
-                    timestamp: Default::default(),
-                    receiver: NetworkAddressWithoutTime {
-                        services: Default::default(),
-                        ipv6: match destination.ip() {
-                            std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
-                            std::net::IpAddr::V6(v6) => v6,
-                        },
-                        port: destination.port(),
-                    },
-                },
-                fields_106: VersionFields106 {
-                    sender: NetworkAddressWithoutTime {
-                        services: Default::default(),
-                        ipv6: std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(),
-                        port: Default::default(),
-                    },
-                    nonce: 07_777_777_777_777_777_777u64,
-                    user_agent: todo!(),
-                    start_height: 0,
-                },
-                fields_70001: VersionFields70001 { relay: false },
-            };
-
-            let mut buf = vec![0u8; std::mem::size_of::<Header>() + body.deparsed_len()];
-
-            body.deparse(&mut buf[std::mem::size_of::<Header>()..]);
-
-            let checksum = <bitcoin_hashes::sha256d::Hash as bitcoin_hashes::Hash>::hash(
-                &buf[std::mem::size_of::<Header>()..],
-            );
-            let header = Header {
+            let message = Message {
                 magic: Magic::Main as _,
-                command: *b"version\0\0\0\0\0",
-                length: body.deparsed_len().try_into().unwrap(),
-                checksum: [checksum[0], checksum[1], checksum[2], checksum[3]],
+                body: MessageBody::Version(Version::Supports70001 {
+                    version: 70001.try_into().unwrap(),
+                    fields: VersionFieldsMandatory {
+                        services: Default::default(),
+                        timestamp: Default::default(),
+                        receiver: NetworkAddressWithoutTime {
+                            services: Default::default(),
+                            ipv6: match destination.ip() {
+                                std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+                                std::net::IpAddr::V6(v6) => v6,
+                            },
+                            port: destination.port(),
+                        },
+                    },
+                    fields_106: VersionFields106 {
+                        sender: NetworkAddressWithoutTime {
+                            services: Default::default(),
+                            ipv6: std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(),
+                            port: Default::default(),
+                        },
+                        nonce: 07_777_777_777_777_777_777u64,
+                        user_agent: String::from("user-agent"),
+                        start_height: 0,
+                    },
+                    fields_70001: VersionFields70001 { relay: false },
+                }),
             };
 
-            header.deparse(&mut buf);
-
-            println!("{buf:x?}");
+            let mut buf = vec![0u8; message.deparsed_len()];
+            message.deparse(&mut buf);
 
             socket.write_all(&buf).wrap_err("couldn't send version")?;
 
-            let mut buf = [0; 100];
+            let mut buf = [0; 1000];
             socket.read(&mut buf).wrap_err("couldn't read verack")?;
-            println!("{buf:x?}");
+            let (_, message) = Message::parse(&buf[..]).unwrap();
+            println!("{message:?}");
             Ok(())
         }
     }

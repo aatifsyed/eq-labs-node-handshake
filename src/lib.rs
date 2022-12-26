@@ -3,12 +3,12 @@
 // like [impl_parse_deparse_each_field].
 // I didn't want to write a procedural macro just for that, so we use these two traits, and use the
 // decl macro to implement for our business structs.
-pub trait Parse<'a>: Sized {
-    fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self>;
+pub trait Parse: Sized {
+    fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self>;
 }
 
-pub trait ParseOwned: for<'a> Parse<'a> {}
-impl<T: for<'a> Parse<'a>> ParseOwned for T {}
+pub trait ParseOwned: for<'a> Parse {}
+impl<T: for<'a> Parse> ParseOwned for T {}
 
 pub trait Deparse {
     /// The size of buffer required to deparse this struct (including all fields)
@@ -21,7 +21,7 @@ pub trait Deparse {
 macro_rules! impl_parse_deparse_each_field {
     (
         $(#[$struct_meta:meta])*
-        $struct_vis:vis struct $struct_name:ident$(<$lifetime:lifetime>)? {
+        $struct_vis:vis struct $struct_name:ident {
             $(
                 $(#[$field_meta:meta])*
                 $field_vis:vis $field_name:ident: $field_ty:ty,
@@ -29,17 +29,15 @@ macro_rules! impl_parse_deparse_each_field {
         }
     ) => {
         $(#[$struct_meta])*
-        $struct_vis struct $struct_name$(<$lifetime>)? {
+        $struct_vis struct $struct_name {
             $(
                 $(#[$field_meta])*
                 $field_vis $field_name: $field_ty,
             )*
         }
-        impl<'a, $($lifetime,)?> $crate::Parse<'a> for $struct_name$(<$lifetime>)?
-        // shenanigans to allow the same macro to be used for borrowed fields
-        $(where $lifetime: 'a, 'a: $lifetime)?
+        impl $crate::Parse for $struct_name
         {
-            fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+            fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
                 let rem = buffer;
                 $(
                     let (rem, $field_name) = <$field_ty as $crate::Parse>::parse(rem)?;
@@ -51,7 +49,7 @@ macro_rules! impl_parse_deparse_each_field {
                 }))
             }
         }
-        impl$(<$lifetime>)? $crate::Deparse for $struct_name$(<$lifetime>)? {
+        impl $crate::Deparse for $struct_name {
             fn deparsed_len(&self) -> usize {
                 [
                     $(
@@ -69,31 +67,6 @@ macro_rules! impl_parse_deparse_each_field {
             }
         }
     };
-}
-
-impl<'a> Parse<'a> for std::borrow::Cow<'a, str> {
-    fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
-        let (rem, length) = VarInt::parse(buffer)?;
-        let (rem, s) = nom::combinator::map_res(
-            // should fail to compile on 32-bit platforms, as nom::traits::ToUsize isn't implemented for u64 on those platforms
-            // so we should be arithmetically safe
-            nom::bytes::streaming::take(length.inner),
-            std::str::from_utf8,
-        )(rem)?;
-        Ok((rem, Self::Borrowed(s)))
-    }
-}
-
-impl Deparse for std::borrow::Cow<'_, str> {
-    fn deparsed_len(&self) -> usize {
-        VarInt::from(self.len()).deparsed_len() + self.len()
-    }
-
-    fn deparse(&self, buffer: &mut [u8]) {
-        let len = VarInt::from(self.len());
-        len.deparse(buffer);
-        frontfill(self.as_bytes(), &mut buffer[len.deparsed_len()..]);
-    }
 }
 
 impl_parse_deparse_each_field!(
@@ -114,8 +87,8 @@ impl_parse_deparse_each_field!(
 macro_rules! impl_parse_deparse_via_le_bytes {
     ($($nom_parser:path => $ty:ty),* $(,)?) => {
         $(
-            impl $crate::Parse<'_> for $ty {
-                fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+            impl $crate::Parse for $ty {
+                fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
                     $nom_parser(buffer)
                 }
             }
@@ -141,11 +114,11 @@ impl_parse_deparse_via_le_bytes!(
     nom::number::streaming::le_u64 => u64,
 );
 
-impl<'a, const N: usize, T> Parse<'a> for [T; N]
+impl<const N: usize, T> Parse for [T; N]
 where
-    T: Parse<'a>,
+    T: Parse,
 {
-    fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+    fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
         use nom::{
             combinator::{complete, map_res},
             multi::many_m_n,
@@ -177,8 +150,8 @@ impl From<usize> for VarInt {
     }
 }
 
-impl Parse<'_> for VarInt {
-    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+impl Parse for VarInt {
+    fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
         use tap::Pipe as _;
         let (rem, inner) = {
             let (rem, first_byte) = u8::parse(buffer)?;
@@ -225,8 +198,8 @@ impl Deparse for VarInt {
     }
 }
 
-impl Parse<'_> for String {
-    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+impl Parse for String {
+    fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
         let (rem, length) = VarInt::parse(buffer)?;
         let (rem, s) = nom::combinator::map_res(
             // should fail to compile on 32-bit platforms, as nom::traits::ToUsize isn't implemented for u64 on those platforms
@@ -250,12 +223,12 @@ impl Deparse for String {
     }
 }
 
-impl<'a, T> Parse<'a> for bitbag::BitBag<T>
+impl<T> Parse for bitbag::BitBag<T>
 where
     T: bitbag::BitBaggable,
-    T::Repr: Parse<'a>,
+    T::Repr: Parse,
 {
-    fn parse(buffer: &'a [u8]) -> nom::IResult<&[u8], Self> {
+    fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
         T::Repr::parse(buffer).map(|(rem, repr)| (rem, bitbag::BitBag::new_unchecked(repr)))
     }
 }
@@ -274,8 +247,8 @@ where
     }
 }
 
-impl Parse<'_> for chrono::NaiveDateTime {
-    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+impl Parse for chrono::NaiveDateTime {
+    fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
         let (rem, timestamp) = nom::combinator::map_res(u64::parse, i64::try_from)(buffer)?;
         let timestamp = chrono::NaiveDateTime::from_timestamp_opt(timestamp.into(), 0).ok_or(
             nom::Err::Error(nom::error::make_error(
@@ -297,8 +270,8 @@ impl Deparse for chrono::NaiveDateTime {
     }
 }
 
-impl Parse<'_> for bool {
-    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+impl Parse for bool {
+    fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
         let (rem, byte) = u8::parse(buffer)?;
         match byte {
             1 => Ok((rem, true)),
@@ -332,8 +305,8 @@ pub struct NetworkAddressWithoutTime {
     pub port: u16,
 }
 
-impl Parse<'_> for NetworkAddressWithoutTime {
-    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+impl Parse for NetworkAddressWithoutTime {
+    fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
         let (rem, services) = Parse::parse(buffer)?;
         let (rem, ipv6) = nom::number::streaming::be_u128(rem)?;
         let (rem, port) = nom::number::streaming::be_u16(rem)?;
@@ -371,20 +344,90 @@ impl Deparse for NetworkAddressWithoutTime {
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct Message {
-    pub magic: Magic,
+    pub magic: u32,
     pub body: MessageBody,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Hash)]
-pub enum Magic {
-    WellKnown(constants::Magic),
-    Other(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum MessageBody {
     Version(Version),
     Verack,
+}
+
+impl MessageBody {
+    fn command(&self) -> [u8; 12] {
+        match self {
+            MessageBody::Version(_) => *b"version\0\0\0\0\0",
+            MessageBody::Verack => *b"verack\0\0\0\0\0\0",
+        }
+    }
+}
+
+impl Parse for Message {
+    fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+        let (rem, header) = Header::parse(buffer)?;
+        let (rem_packet, body) = nom::bytes::streaming::take(header.length)(rem)?;
+        match &header.command {
+            b"version\0\0\0\0\0" => {
+                let (rem_body, version) = Version::parse(body)?;
+                if !rem_body.is_empty() {
+                    // ?
+                }
+                Ok((
+                    rem_packet,
+                    Message {
+                        magic: header.magic,
+                        body: MessageBody::Version(version),
+                    },
+                ))
+            }
+            b"verack\0\0\0\0\0\0" => {
+                if !header.length == 0 {
+                    todo!()
+                }
+                Ok((
+                    rem_packet,
+                    Message {
+                        magic: header.magic,
+                        body: MessageBody::Verack,
+                    },
+                ))
+            }
+            _ => todo!(),
+        }
+    }
+}
+
+impl Deparse for Message {
+    fn deparsed_len(&self) -> usize {
+        std::mem::size_of::<Header>()
+            + match &self.body {
+                MessageBody::Version(version) => version.deparsed_len(),
+                MessageBody::Verack => 0,
+            }
+    }
+
+    fn deparse(&self, buffer: &mut [u8]) {
+        let (length, checksum) = match &self.body {
+            MessageBody::Version(version) => {
+                let body = &mut buffer[std::mem::size_of::<Header>()..];
+                version.deparse(body);
+                let checksum = <bitcoin_hashes::sha256d::Hash as bitcoin_hashes::Hash>::hash(body);
+                (
+                    version.deparsed_len(),
+                    [checksum[0], checksum[1], checksum[2], checksum[3]],
+                )
+            }
+            MessageBody::Verack => (0, [0; 4]),
+        };
+        let header = Header {
+            magic: self.magic,
+            command: self.body.command(),
+            length: length as _,
+            checksum,
+        };
+        header.deparse(buffer)
+    }
 }
 
 macro_rules! impl_for_clamped {
@@ -440,8 +483,8 @@ pub enum Version {
     },
 }
 
-impl Parse<'_> for Version {
-    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+impl Parse for Version {
+    fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
         let (rem, version) = u32::parse(buffer)?;
         match version {
             ..=105 => {
@@ -622,7 +665,7 @@ mod tests {
 
     fn do_test<'a, T>(example_bin: impl IntoIterator<Item = &'a str>, expected: T)
     where
-        for<'b> T: Parse<'b>,
+        for<'b> T: Parse,
         T: Deparse + PartialEq + std::fmt::Debug,
     {
         use pretty_assertions::assert_eq;
