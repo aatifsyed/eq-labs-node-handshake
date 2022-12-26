@@ -1,6 +1,314 @@
-pub mod deparse;
-
 use std::borrow::Cow;
+
+// Initial implementation used [nom_derive::Parse] trait, but the [nom_derive::Nom] derive macro
+// is a little janky, and doesn't work if the struct definition is nested inside a declarative macro
+// like [impl_parse_deparse_each_field].
+// I didn't want to write a procedural macro just for that, so we use these two traits, and use the
+// decl macro to implement for our business structs.
+pub trait Parse<'a>: Sized + 'a {
+    fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self>;
+}
+
+pub trait ParseOwned: for<'a> Parse<'a> {}
+impl<T: for<'a> Parse<'a>> ParseOwned for T {}
+
+pub trait Deparse {
+    /// The size of buffer required to deparse this struct (including all fields)
+    fn deparsed_len(&self) -> usize;
+    /// Deparse this struct into a buffer
+    fn deparse(&self, buffer: &mut [u8]);
+}
+
+// bargain bucket derive macro
+macro_rules! impl_parse_deparse_each_field {
+    (
+        $(#[$struct_meta:meta])*
+        $struct_vis:vis struct $struct_ident:ident$(<$generics:tt>)? {
+            $(
+                $(#[$field_meta:meta])*
+                $field_vis:vis $field_name:ident: $field_ty:ty,
+            )*
+        }
+    ) => {
+        $(#[$struct_meta])*
+        $struct_vis struct $struct_ident$(<$generics>)? {
+            $(
+                $(#[$field_meta])*
+                $field_vis $field_name: $field_ty,
+            )*
+        }
+        impl<'a, $($generics)?> $crate::Parse<'a> for $struct_ident$(<$generics>)? {
+            fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+                let rem = buffer;
+                $(
+                    let (rem, $field_name) = <$field_ty as $crate::Parse>::parse(rem)?;
+                )*
+                Ok((rem, Self {
+                    $(
+                        $field_name,
+                    )*
+                }))
+            }
+        }
+        impl$(<$generics>)? $crate::Deparse for $struct_ident$(<$generics>)? {
+            fn deparsed_len(&self) -> usize {
+                [
+                    $(
+                        <$field_ty as $crate::Deparse>::deparsed_len(&self.$field_name),
+                    )*
+                ].into_iter().sum()
+            }
+            fn deparse(&self, buffer: &mut [u8]) {
+                let buffer = &mut buffer[0..];
+                $(
+                    <$field_ty as $crate::Deparse>::deparse(&self.$field_name, buffer);
+                    let buffer = &mut buffer[<$field_ty as $crate::Deparse>::deparsed_len(&self.$field_name)..];
+                )*
+                let _ = buffer;
+            }
+        }
+    };
+}
+
+impl_parse_deparse_each_field!(
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[repr(C)]
+    pub struct Header {
+        /// Magic value indicating message origin network, and used to seek to next message when stream state is unknown
+        pub magic: u32,
+        /// ASCII string identifying the packet content, NULL padded (non-NULL padding results in packet rejected)
+        pub command: [u8; 12],
+        /// Length of payload in number of bytes
+        pub length: u32,
+        /// First 4 bytes of sha256(sha256(payload))
+        pub checksum: [u8; 4],
+    }
+);
+
+macro_rules! impl_parse_deparse_via_le_bytes {
+    ($($nom_parser:path => $ty:ty),* $(,)?) => {
+        $(
+            impl $crate::Parse<'_> for $ty {
+                fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+                    $nom_parser(buffer)
+                }
+            }
+            impl $crate::Deparse for $ty {
+                fn deparsed_len(&self) -> usize {
+                    std::mem::size_of::<Self>()
+                }
+
+                fn deparse(&self, buffer: &mut [u8]) {
+                    buffer.copy_from_slice(&self.to_le_bytes())
+                }
+            }
+        )*
+    };
+}
+
+impl_parse_deparse_via_le_bytes!(
+    nom::number::streaming::le_u8 => u8,
+    nom::number::streaming::le_u16 => u16,
+    nom::number::streaming::le_i32 => i32,
+    nom::number::streaming::le_u32 => u32,
+    nom::number::streaming::le_i64 => i64,
+    nom::number::streaming::le_u64 => u64,
+);
+
+impl<'a, const N: usize, T> Parse<'a> for [T; N]
+where
+    T: Parse<'a>,
+{
+    fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+        use nom::{
+            combinator::{complete, map_res},
+            multi::many_m_n,
+        };
+        map_res(many_m_n(N, N, complete(<T>::parse)), Self::try_from)(buffer)
+    }
+}
+
+impl<const N: usize> Deparse for [u8; N] {
+    fn deparsed_len(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+
+    fn deparse(&self, buffer: &mut [u8]) {
+        use zerocopy::AsBytes; // TODO(aatifsyed) can we just use nom::AsBytes?
+        buffer.copy_from_slice(self.as_bytes())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VarInt {
+    pub inner: u64,
+}
+
+impl Parse<'_> for VarInt {
+    fn parse<'a>(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+        use tap::Pipe as _;
+        let (rem, inner) = {
+            let (rem, first_byte) = u8::parse(buffer)?;
+            match first_byte {
+                // 0xFF followed by the length as uint64_t
+                0xFF => u64::parse(rem)?,
+                // 0xFE followed by the length as uint32_t
+                0xFE => u32::parse(rem)?.pipe(|(rem, i)| (rem, i as u64)),
+                // 0xFD followed by the length as uint16_t
+                0xFD => u16::parse(rem)?.pipe(|(rem, i)| (rem, i as u64)),
+                i => (rem, i.into()),
+            }
+        };
+        Ok((rem, Self { inner }))
+    }
+}
+
+impl Deparse for VarInt {
+    fn deparsed_len(&self) -> usize {
+        match self.inner {
+            ..=0xFE => 1,
+            ..=0xFFFF => 3,
+            ..=0xFFFF_FFFF => 5,
+            _ => 9,
+        }
+    }
+
+    fn deparse(&self, buffer: &mut [u8]) {
+        match self.inner {
+            small @ ..=0xFE => buffer[0] = small as u8,
+            medium @ ..=0xFFFF => {
+                buffer[0] = 0xFD;
+                buffer[1..].copy_from_slice(&u16::to_le_bytes(medium as _))
+            }
+            large @ ..=0xFFFF_FFFF => {
+                buffer[0] = 0xFE;
+                buffer[1..].copy_from_slice(&u32::to_le_bytes(large as _))
+            }
+            xlarge => {
+                buffer[0] = 0xFF;
+                buffer[1..].copy_from_slice(&u64::to_le_bytes(xlarge as _))
+            }
+        }
+    }
+}
+
+impl<'a> Parse<'a> for Cow<'a, str> {
+    fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+        let (rem, length) = VarInt::parse(buffer)?;
+        let (rem, s) = nom::combinator::map_res(
+            // should fail to compile on 32-bit platforms, as nom::traits::ToUsize isn't implemented for u64 on those platforms
+            // so we should be arithmetically safe
+            nom::bytes::streaming::take(length.inner),
+            std::str::from_utf8,
+        )(rem)?;
+        Ok((rem, Cow::Borrowed(s)))
+    }
+}
+
+impl<'a, T> Parse<'a> for bitbag::BitBag<T>
+where
+    T: bitbag::BitBaggable + 'a,
+    T::Repr: Parse<'a>,
+{
+    fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+        T::Repr::parse(buffer).map(|(rem, repr)| (rem, bitbag::BitBag::new_unchecked(repr)))
+    }
+}
+
+impl<T> Deparse for bitbag::BitBag<T>
+where
+    T: bitbag::BitBaggable,
+    T::Repr: Deparse,
+{
+    fn deparsed_len(&self) -> usize {
+        self.inner().deparsed_len()
+    }
+
+    fn deparse(&self, buffer: &mut [u8]) {
+        self.inner().deparse(buffer)
+    }
+}
+
+impl Parse<'_> for chrono::NaiveDateTime {
+    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+        let (rem, timestamp) = nom::combinator::map_res(u64::parse, i64::try_from)(buffer)?;
+        let timestamp = chrono::NaiveDateTime::from_timestamp_opt(timestamp.into(), 0).ok_or(
+            nom::Err::Error(nom::error::make_error(
+                buffer,
+                nom::error::ErrorKind::MapOpt,
+            )),
+        )?;
+        Ok((rem, timestamp))
+    }
+}
+
+impl Deparse for chrono::NaiveDateTime {
+    fn deparsed_len(&self) -> usize {
+        std::mem::size_of::<i64>()
+    }
+
+    fn deparse(&self, buffer: &mut [u8]) {
+        buffer.copy_from_slice(&self.timestamp().to_le_bytes())
+    }
+}
+
+impl Parse<'_> for bool {
+    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+        let (rem, byte) = u8::parse(buffer)?;
+        match byte {
+            1 => Ok((rem, true)),
+            0 => Ok((rem, false)),
+            // TODO(aatifsyed) plumb the errors here properly
+            _ => Err(nom::Err::Error(nom::error::Error::new(
+                buffer,
+                nom::error::ErrorKind::Alt,
+            ))),
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NetworkAddressWithoutTime {
+    pub services: bitbag::BitBag<crate::constants::Services>,
+    pub ipv6: std::net::Ipv6Addr,
+    pub port: u16,
+}
+
+impl Parse<'_> for NetworkAddressWithoutTime {
+    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+        let (rem, services) = Parse::parse(buffer)?;
+        let (rem, ipv6) = nom::number::streaming::be_u128(rem)?;
+        let (rem, port) = nom::number::streaming::be_u16(rem)?;
+        Ok((
+            rem,
+            Self {
+                services,
+                ipv6: ipv6.into(),
+                port,
+            },
+        ))
+    }
+}
+
+fn frontfill(src: &[u8], dst: &mut [u8]) {
+    for (src, dst) in src.iter().zip(dst) {
+        *dst = *src
+    }
+}
+
+impl Deparse for NetworkAddressWithoutTime {
+    fn deparsed_len(&self) -> usize {
+        self.services.deparsed_len() + std::mem::size_of::<u128>() + std::mem::size_of::<u16>()
+    }
+
+    fn deparse(&self, buffer: &mut [u8]) {
+        let buffer = &mut buffer[0..];
+        self.services.deparse(buffer);
+        let buffer = &mut buffer[self.services.deparsed_len()..];
+        frontfill(&u128::from(self.ipv6).to_be_bytes(), buffer);
+        let buffer = &mut buffer[std::mem::size_of::<u128>()..];
+        frontfill(&self.port.to_be_bytes(), buffer);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct Message<'a> {
@@ -126,36 +434,33 @@ impl Version<'_> {
     }
 }
 
+impl_parse_deparse_each_field! {
 // https://en.bitcoin.it/wiki/Protocol_documentation#version
-#[derive(Debug, Clone, PartialEq, Hash, nom_derive::Nom)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct VersionFieldsMandatory {
     /// Bitfield of features to be enabled for this connection.
-    #[nom(Parse = "parse::bitbag")]
     pub services: bitbag::BitBag<crate::constants::Services>,
     /// Standard UNIX timestamp in seconds.
-    #[nom(Parse = "parse::timestamp")]
     pub timestamp: chrono::NaiveDateTime,
     /// The network address of the node receiving this message.
-    pub receiver: SocketAddrAndServices,
-}
+    pub receiver: NetworkAddressWithoutTime,
+}}
 
-// https://en.bitcoin.it/wiki/Protocol_documentation#version
-#[derive(Debug, Clone, PartialEq, Hash, nom_derive::Nom)]
-pub struct VersionFields106<'a> {
+impl_parse_deparse_each_field! {
+    // https://en.bitcoin.it/wiki/Protocol_documentation#version
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct VersionFields106<'user_agent> {
     /// Field can be ignored.
     /// This used to be the network address of the node emitting this message, but most P2P implementations send 26 dummy bytes.
     /// The "services" field of the address would also be redundant with the second field of the version message.
-    pub sender: SocketAddrAndServices,
+    pub sender: NetworkAddressWithoutTime,
     /// Node random nonce, randomly generated every time a version packet is sent. This nonce is used to detect connections to self.
-    #[nom(LittleEndian)]
     pub nonce: u64,
     /// User Agent (0x00 if string is 0 bytes long)
-    #[nom(Parse = "parse::var_str")]
-    pub user_agent: Cow<'a, str>,
+    pub user_agent: Cow<'user_agent, str>,
     /// The last block received by the emitting node
-    #[nom(LittleEndian)]
     pub start_height: u32,
-}
+}}
 
 // https://en.bitcoin.it/wiki/Protocol_documentation#version
 #[derive(Debug, Clone, PartialEq, Hash, nom_derive::Nom)]
@@ -263,26 +568,6 @@ mod parse {
     }
 }
 
-mod wire {
-    use zerocopy::byteorder::{LE, U32};
-
-    // https://en.bitcoin.it/wiki/Protocol_documentation#Message_structure
-    #[derive(Debug, zerocopy::AsBytes, nom_derive::Nom, Clone, Copy, PartialEq, Eq, Hash)]
-    #[repr(C)]
-    pub struct Header {
-        #[nom(Parse = "crate::parse::u32_le")]
-        /// Magic value indicating message origin network, and used to seek to next message when .stream state is unknown
-        pub magic: U32<LE>,
-        /// ASCII string identifying the packet content, NULL padded (non-NULL padding results in .packet rejected)
-        pub command: [u8; 12],
-        /// Length of payload in number of bytes.
-        #[nom(Parse = "crate::parse::u32_le")]
-        pub length: U32<LE>,
-        /// First 4 bytes of sha256(sha256(payload)).
-        pub checksum: [u8; 4],
-    }
-}
-
 pub mod constants {
     #[derive(Debug, bitbag::BitBaggable, Clone, Copy, PartialEq, Eq, Hash)]
     #[repr(u64)]
@@ -324,7 +609,7 @@ pub mod constants {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nom_derive::Parse;
+    use nom_derive::Parse as _;
     use pretty_assertions::assert_eq;
 
     fn decode_hex<'a>(s: impl IntoIterator<Item = &'a str>) -> Vec<u8> {
@@ -366,15 +651,16 @@ mod tests {
                 fields: VersionFieldsMandatory {
                     services: crate::constants::Services::NodeNetwork.into(),
                     timestamp: "2012-12-18T18:12:33".parse().unwrap(),
-                    receiver: SocketAddrAndServices {
-                        services: crate::constants::Services::NodeNetwork.into(),
-                        address: std::net::SocketAddrV6::new(
-                            std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(),
-                            0,
-                            0,
-                            0
-                        )
-                    }
+                    // receiver: SocketAddrAndServices {
+                    //     services: crate::constants::Services::NodeNetwork.into(),
+                    //     address: std::net::SocketAddrV6::new(
+                    //         std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(),
+                    //         0,
+                    //         0,
+                    //         0
+                    //     )
+                    // }
+                    receiver: todo!()
                 },
                 fields_106: VersionFields106 {
                     sender: SocketAddrAndServices {
@@ -395,24 +681,53 @@ mod tests {
         assert_eq!(0, rem.len());
     }
 
-    #[test]
-    fn test_parse_header() {
-        let input = decode_hex([
-            "F9 BE B4 D9",                         // - Main network magic bytes
-            "76 65 72 73 69 6F 6E 00 00 00 00 00", // - "version" command
-            "64 00 00 00",                         // - Payload is 100 bytes long
-            "35 8d 49 32",                         // - payload checksum (internal byte order)
-        ]);
-        let (rem, header) = wire::Header::parse(&input).unwrap();
+    fn do_test<'a, T>(example_bin: impl IntoIterator<Item = &'a str>, expected: T)
+    where
+        for<'b> T: Parse<'b>,
+        T: Deparse + PartialEq + std::fmt::Debug,
+    {
+        use pretty_assertions::assert_eq;
+        use tap::Pipe;
+
+        let example_bin = example_bin
+            .into_iter()
+            .flat_map(str::chars)
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .pipe(hex::decode)
+            .expect("example is not valid hex");
+
+        let (leftover, parsed_bin) =
+            T::parse(example_bin.as_slice()).expect("parsing the example text failed");
+        assert_eq!(leftover.len(), 0, "example text wasn't fully parsed");
         assert_eq!(
-            header,
-            wire::Header {
-                magic: (crate::constants::Magic::Main as u32).into(),
-                command: *b"version\0\0\0\0\0",
-                length: 100.into(),
-                checksum: [0x35, 0x8d, 0x49, 0x32]
-            }
+            expected, parsed_bin,
+            "the parsed example text doesn't match the expected struct"
         );
-        assert_eq!(0, rem.len());
+
+        let mut unparsed_bin = vec![0u8; expected.deparsed_len()];
+        expected.deparse(&mut unparsed_bin);
+        assert_eq!(
+            example_bin, unparsed_bin,
+            "the unparsed struct doesn't match the example bin"
+        );
+    }
+
+    #[test]
+    fn test_header() {
+        do_test(
+            [
+                "F9 BE B4 D9",                         // - Main network magic bytes
+                "76 65 72 73 69 6F 6E 00 00 00 00 00", // - "version" command
+                "64 00 00 00",                         // - Payload is 100 bytes long
+                "35 8d 49 32",                         // - payload checksum (internal byte order)
+            ],
+            Header {
+                magic: crate::constants::Magic::Main as u32,
+                command: *b"version\0\0\0\0\0",
+                length: 100,
+                checksum: [0x35, 0x8d, 0x49, 0x32],
+            },
+        )
     }
 }
