@@ -1,11 +1,9 @@
-use std::borrow::Cow;
-
 // Initial implementation used [nom_derive::Parse] trait, but the [nom_derive::Nom] derive macro
 // is a little janky, and doesn't work if the struct definition is nested inside a declarative macro
 // like [impl_parse_deparse_each_field].
 // I didn't want to write a procedural macro just for that, so we use these two traits, and use the
 // decl macro to implement for our business structs.
-pub trait Parse<'a>: Sized + 'a {
+pub trait Parse<'a>: Sized {
     fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self>;
 }
 
@@ -99,7 +97,7 @@ macro_rules! impl_parse_deparse_via_le_bytes {
                 }
 
                 fn deparse(&self, buffer: &mut [u8]) {
-                    buffer.copy_from_slice(&self.to_le_bytes())
+                    frontfill(&self.to_le_bytes(), buffer)
                 }
             }
         )*
@@ -135,13 +133,20 @@ impl<const N: usize> Deparse for [u8; N] {
 
     fn deparse(&self, buffer: &mut [u8]) {
         use zerocopy::AsBytes; // TODO(aatifsyed) can we just use nom::AsBytes?
-        buffer.copy_from_slice(self.as_bytes())
+        frontfill(self.as_bytes(), buffer)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VarInt {
     pub inner: u64,
+}
+
+#[cfg(target_pointer_width = "64")]
+impl From<usize> for VarInt {
+    fn from(value: usize) -> Self {
+        Self { inner: value as _ }
+    }
 }
 
 impl Parse<'_> for VarInt {
@@ -178,22 +183,22 @@ impl Deparse for VarInt {
             small @ ..=0xFE => buffer[0] = small as u8,
             medium @ ..=0xFFFF => {
                 buffer[0] = 0xFD;
-                buffer[1..].copy_from_slice(&u16::to_le_bytes(medium as _))
+                frontfill(&u16::to_le_bytes(medium as _), &mut buffer[1..])
             }
             large @ ..=0xFFFF_FFFF => {
                 buffer[0] = 0xFE;
-                buffer[1..].copy_from_slice(&u32::to_le_bytes(large as _))
+                frontfill(&u32::to_le_bytes(large as _), &mut buffer[1..])
             }
             xlarge => {
                 buffer[0] = 0xFF;
-                buffer[1..].copy_from_slice(&u64::to_le_bytes(xlarge as _))
+                frontfill(&u64::to_le_bytes(xlarge as _), &mut buffer[1..])
             }
         }
     }
 }
 
-impl<'a> Parse<'a> for Cow<'a, str> {
-    fn parse(buffer: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
+impl Parse<'_> for String {
+    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
         let (rem, length) = VarInt::parse(buffer)?;
         let (rem, s) = nom::combinator::map_res(
             // should fail to compile on 32-bit platforms, as nom::traits::ToUsize isn't implemented for u64 on those platforms
@@ -201,7 +206,19 @@ impl<'a> Parse<'a> for Cow<'a, str> {
             nom::bytes::streaming::take(length.inner),
             std::str::from_utf8,
         )(rem)?;
-        Ok((rem, Cow::Borrowed(s)))
+        Ok((rem, String::from(s)))
+    }
+}
+
+impl Deparse for String {
+    fn deparsed_len(&self) -> usize {
+        VarInt::from(self.len()).deparsed_len() + self.len()
+    }
+
+    fn deparse(&self, buffer: &mut [u8]) {
+        let len = VarInt::from(self.len());
+        len.deparse(buffer);
+        frontfill(self.as_bytes(), &mut buffer[len.deparsed_len()..]);
     }
 }
 
@@ -248,7 +265,7 @@ impl Deparse for chrono::NaiveDateTime {
     }
 
     fn deparse(&self, buffer: &mut [u8]) {
-        buffer.copy_from_slice(&self.timestamp().to_le_bytes())
+        frontfill(&self.timestamp().to_le_bytes(), buffer)
     }
 }
 
@@ -266,6 +283,20 @@ impl Parse<'_> for bool {
         }
     }
 }
+
+impl Deparse for bool {
+    fn deparsed_len(&self) -> usize {
+        1
+    }
+
+    fn deparse(&self, buffer: &mut [u8]) {
+        match self {
+            true => buffer[0] = 1,
+            false => buffer[0] = 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NetworkAddressWithoutTime {
     pub services: bitbag::BitBag<crate::constants::Services>,
@@ -311,9 +342,9 @@ impl Deparse for NetworkAddressWithoutTime {
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
-pub struct Message<'a> {
+pub struct Message {
     pub magic: Magic,
-    pub body: MessageBody<'a>,
+    pub body: MessageBody,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Hash)]
@@ -323,9 +354,31 @@ pub enum Magic {
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
-pub enum MessageBody<'a> {
-    Version(Version<'a>),
+pub enum MessageBody {
+    Version(Version),
     Verack,
+}
+
+macro_rules! impl_for_clamped {
+    () => {
+        fn deparsed_len(&self) -> usize {
+            std::mem::size_of::<u32>()
+        }
+
+        fn deparse(&self, buffer: &mut [u8]) {
+            u32::from(*self).deparse(buffer)
+        }
+    };
+}
+
+impl<const UPPER: u32> Deparse for clamped::ClampedU32To<UPPER> {
+    impl_for_clamped!();
+}
+impl<const LOWER: u32, const UPPER: u32> Deparse for clamped::ClampedU32<LOWER, UPPER> {
+    impl_for_clamped!();
+}
+impl<const UPPER: u32> Deparse for clamped::ClampedU32From<UPPER> {
+    impl_for_clamped!();
 }
 
 /// Protocol version `..106`.
@@ -341,7 +394,7 @@ type Version70001 = clamped::ClampedU32From<70001>;
 /// Progressive versions added more fields, which can be accessed based on enum variant.
 // Illegal states (mismatched version numbers) are unrepresentable.
 #[derive(Debug, Clone, PartialEq, Hash)]
-pub enum Version<'a> {
+pub enum Version {
     Basic {
         version: VersionBasic,
         fields: VersionFieldsMandatory,
@@ -349,19 +402,19 @@ pub enum Version<'a> {
     Supports106 {
         version: Version106,
         fields: VersionFieldsMandatory,
-        fields_106: VersionFields106<'a>,
+        fields_106: VersionFields106,
     },
     Supports70001 {
         version: Version70001,
         fields: VersionFieldsMandatory,
-        fields_106: VersionFields106<'a>,
+        fields_106: VersionFields106,
         fields_70001: VersionFields70001,
     },
 }
 
-impl<'a> nom_derive::Parse<&'a [u8]> for Version<'a> {
-    fn parse(initial_input: &'a [u8]) -> nom::IResult<&'a [u8], Self> {
-        let (rem, version) = u32::parse_le(initial_input)?;
+impl Parse<'_> for Version {
+    fn parse(buffer: &[u8]) -> nom::IResult<&[u8], Self> {
+        let (rem, version) = u32::parse(buffer)?;
         match version {
             ..=105 => {
                 let version =
@@ -403,7 +456,34 @@ impl<'a> nom_derive::Parse<&'a [u8]> for Version<'a> {
     }
 }
 
-impl Version<'_> {
+impl Deparse for Version {
+    fn deparsed_len(&self) -> usize {
+        let mut len = self.version().deparsed_len() + self.fields().deparsed_len();
+        if let Some(fields_106) = self.fields_106() {
+            len += fields_106.deparsed_len();
+            if let Some(fields_70001) = self.fields_70001() {
+                len += fields_70001.deparsed_len()
+            }
+        }
+        len
+    }
+
+    fn deparse(&self, buffer: &mut [u8]) {
+        self.version().deparse(buffer);
+        let buffer = &mut buffer[self.version().deparsed_len()..];
+        self.fields().deparse(buffer);
+        let buffer = &mut buffer[self.fields().deparsed_len()..];
+        if let Some(fields_106) = self.fields_106() {
+            fields_106.deparse(buffer);
+            let buffer = &mut buffer[fields_106.deparsed_len()..];
+            if let Some(fields_70001) = self.fields_70001() {
+                fields_70001.deparse(buffer)
+            }
+        }
+    }
+}
+
+impl Version {
     pub fn version(&self) -> u32 {
         match self {
             Version::Basic { version, .. } => (*version).into(),
@@ -449,7 +529,7 @@ pub struct VersionFieldsMandatory {
 impl_parse_deparse_each_field! {
     // https://en.bitcoin.it/wiki/Protocol_documentation#version
 #[derive(Debug, Clone, PartialEq, Hash)]
-pub struct VersionFields106<'user_agent> {
+pub struct VersionFields106 {
     /// Field can be ignored.
     /// This used to be the network address of the node emitting this message, but most P2P implementations send 26 dummy bytes.
     /// The "services" field of the address would also be redundant with the second field of the version message.
@@ -457,140 +537,42 @@ pub struct VersionFields106<'user_agent> {
     /// Node random nonce, randomly generated every time a version packet is sent. This nonce is used to detect connections to self.
     pub nonce: u64,
     /// User Agent (0x00 if string is 0 bytes long)
-    pub user_agent: Cow<'user_agent, str>,
+    pub user_agent: String,
     /// The last block received by the emitting node
     pub start_height: u32,
 }}
 
+impl_parse_deparse_each_field! {
 // https://en.bitcoin.it/wiki/Protocol_documentation#version
-#[derive(Debug, Clone, PartialEq, Hash, nom_derive::Nom)]
+#[derive(Debug, Clone, PartialEq, Hash, )]
 pub struct VersionFields70001 {
     /// Whether the remote peer should announce relayed transactions or not, see BIP 0037
-    #[nom(Parse = "parse::bool")]
     pub relay: bool,
-}
-
-// https://en.bitcoin.it/wiki/Protocol_documentation#version
-#[derive(Debug, Clone, PartialEq, Hash, nom_derive::Nom)]
-pub struct SocketAddrAndServices {
-    /// See [VersionFieldsMandatory::services]
-    #[nom(Parse = "parse::bitbag")]
-    pub services: bitbag::BitBag<crate::constants::Services>,
-    /// The original client only supported IPv4 and only read the last 4 bytes to get the IPv4 address.
-    /// However, the IPv4 address is written into the message as a 16 byte IPv4-mapped IPv6 address.
-    ///    (12 bytes 00 00 00 00 00 00 00 00 00 00 FF FF, followed by the 4 bytes of the IPv4 address).
-    #[nom(Parse = "parse::socket_addr")]
-    pub address: std::net::SocketAddrV6,
-}
-
-mod parse {
-    use std::borrow::Cow;
-
-    use nom_derive::Parse as _;
-    use tap::Pipe as _;
-    use zerocopy::{LE, U32};
-
-    pub fn bitbag<'a, BitBaggableT>(
-        initial_input: &'a [u8],
-    ) -> nom::IResult<&'a [u8], bitbag::BitBag<BitBaggableT>>
-    where
-        BitBaggableT: bitbag::BitBaggable,
-        BitBaggableT::Repr: nom_derive::Parse<&'a [u8]>,
-    {
-        BitBaggableT::Repr::parse_le(initial_input)
-            .map(|(rem, repr)| (rem, bitbag::BitBag::new_unchecked(repr)))
-    }
-
-    pub fn socket_addr<'a>(
-        initial_input: &'a [u8],
-    ) -> nom::IResult<&'a [u8], std::net::SocketAddrV6> {
-        let (rem, ipv6) = u128::parse_be(initial_input)?;
-        let (rem, port) = u16::parse_be(rem)?;
-        let addr = std::net::SocketAddrV6::new(std::net::Ipv6Addr::from(ipv6), port, 0, 0);
-        Ok((rem, addr))
-    }
-
-    pub fn bool(initial_input: &[u8]) -> nom::IResult<&[u8], bool> {
-        let (rem, byte) = <u8 as nom_derive::Parse<&[u8]>>::parse(initial_input)?;
-        match byte {
-            1 => Ok((rem, true)),
-            0 => Ok((rem, false)),
-            // TODO(aatifsyed) plumb the errors here properly
-            _ => Err(nom::Err::Error(nom::error::Error::new(
-                initial_input,
-                nom::error::ErrorKind::Alt,
-            ))),
-        }
-    }
-
-    pub fn var_int<'a>(initial_input: &'a [u8]) -> nom::IResult<&'a [u8], u64> {
-        let (rem, i) = {
-            let (rem, first_byte) = u8::parse(initial_input)?;
-            match first_byte {
-                // 0xFF followed by the length as uint64_t
-                0xFF => u64::parse_le(rem)?,
-                // 0xFE followed by the length as uint32_t
-                0xFE => u32::parse_le(rem)?.pipe(|(rem, i)| (rem, i as u64)),
-                // 0xFD followed by the length as uint16_t
-                0xFD => u16::parse_le(rem)?.pipe(|(rem, i)| (rem, i as u64)),
-                i => (rem, i.into()),
-            }
-        };
-        Ok((rem, i))
-    }
-
-    pub fn var_str<'a>(initial_input: &'a [u8]) -> nom::IResult<&'a [u8], Cow<'a, str>> {
-        let (rem, length) = var_int(initial_input)?;
-        let (rem, s) = nom::combinator::map_res(
-            // should fail to compile on 32-bit platforms, as nom::traits::ToUsize isn't implemented for u64 on those platforms
-            // so we should be arithmetically safe
-            nom::bytes::streaming::take(length),
-            std::str::from_utf8,
-        )(rem)?;
-        Ok((rem, Cow::Borrowed(s)))
-    }
-
-    pub fn timestamp<'a>(initial_input: &'a [u8]) -> nom::IResult<&'a [u8], chrono::NaiveDateTime> {
-        let (rem, timestamp) =
-            nom::combinator::map_res(u64::parse_le, i64::try_from)(initial_input)?;
-        let timestamp = chrono::NaiveDateTime::from_timestamp_opt(timestamp.into(), 0).ok_or(
-            nom::Err::Error(nom::error::make_error(
-                initial_input,
-                nom::error::ErrorKind::MapOpt,
-            )),
-        )?;
-        Ok((rem, timestamp))
-    }
-
-    pub fn u32_le<'a>(initial_input: &'a [u8]) -> nom::IResult<&'a [u8], U32<LE>> {
-        let (rem, u) = u32::parse_le(initial_input)?;
-        Ok((rem, U32::from_bytes(u.to_le_bytes())))
-    }
-}
+}}
 
 pub mod constants {
     #[derive(Debug, bitbag::BitBaggable, Clone, Copy, PartialEq, Eq, Hash)]
     #[repr(u64)]
     pub enum Services {
-        ///	`NODE_NETWORK`
+        /// `NODE_NETWORK`
         /// This node can be asked for full blocks instead of just headers.
         NodeNetwork = 1,
-        ///	`NODE_GETUTXO`
+        /// `NODE_GETUTXO`
         /// See BIP 0064.
         NodeGetutxo = 2,
-        ///	`NODE_BLOOM`
+        /// `NODE_BLOOM`
         /// See BIP 0111.
         NodeBloom = 4,
-        ///	`NODE_WITNESS`
+        /// `NODE_WITNESS`
         /// See BIP 0144.
         NodeWitness = 8,
-        ///	`NODE_XTHIN`
+        /// `NODE_XTHIN`
         /// Never formally proposed (as a BIP), and discontinued. Was historically sporadically seen on the network.
         NodeXthin = 16,
-        ///	`NODE_COMPACT_FILTERS`
+        /// `NODE_COMPACT_FILTERS`
         /// See BIP 0157.
         NodeCompactFilters = 64,
-        ///	`NODE_NETWORK_LIMITED`
+        /// `NODE_NETWORK_LIMITED`
         /// See BIP 0159.
         NodeNetworkLimited = 1024,
     }
@@ -609,77 +591,6 @@ pub mod constants {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nom_derive::Parse as _;
-    use pretty_assertions::assert_eq;
-
-    fn decode_hex<'a>(s: impl IntoIterator<Item = &'a str>) -> Vec<u8> {
-        use tap::Pipe;
-
-        s.into_iter()
-            .flat_map(str::chars)
-            .filter(char::is_ascii_alphanumeric)
-            .collect::<String>()
-            .pipe(hex::decode)
-            .expect("input is not valid hex")
-    }
-
-    #[test]
-    fn test_parse_var_str() {
-        let input = decode_hex(["0F 2F 53 61 74 6F 73 68 69 3A 30 2E 37 2E 32 2F"]);
-        let (rem, str) = parse::var_str(&input).unwrap();
-        assert_eq!(0, rem.len());
-        assert_eq!(str, "/Satoshi:0.7.2/");
-    }
-
-    #[test]
-    fn test_parse_version() {
-        let input = decode_hex([
-            "62 EA 00 00",             // - 60002 (protocol version 60002)
-            "01 00 00 00 00 00 00 00", // - 1 (NODE_NETWORK services)
-            "11 B2 D0 50 00 00 00 00", // - Tue Dec 18 10:12:33 PST 2012
-            "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF 00 00 00 00 00 00", // - Recipient address info - see Network Address
-            "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF 00 00 00 00 00 00", // - Sender address info - see Network Address
-            "3B 2E B3 5D 8C E6 17 65",                         // - Node ID
-            "0F 2F 53 61 74 6F 73 68 69 3A 30 2E 37 2E 32 2F", // - "/Satoshi:0.7.2/" sub-version string (string is 15 bytes long)
-            "C0 3E 03 00", // - Last block sending node has is block #212672
-        ]);
-        let (rem, version) = Version::parse(&input).unwrap();
-        assert_eq!(
-            version,
-            Version::Supports106 {
-                version: 60002.try_into().unwrap(),
-                fields: VersionFieldsMandatory {
-                    services: crate::constants::Services::NodeNetwork.into(),
-                    timestamp: "2012-12-18T18:12:33".parse().unwrap(),
-                    // receiver: SocketAddrAndServices {
-                    //     services: crate::constants::Services::NodeNetwork.into(),
-                    //     address: std::net::SocketAddrV6::new(
-                    //         std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(),
-                    //         0,
-                    //         0,
-                    //         0
-                    //     )
-                    // }
-                    receiver: todo!()
-                },
-                fields_106: VersionFields106 {
-                    sender: SocketAddrAndServices {
-                        services: crate::constants::Services::NodeNetwork.into(),
-                        address: std::net::SocketAddrV6::new(
-                            std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(),
-                            0,
-                            0,
-                            0
-                        )
-                    },
-                    nonce: 7284544412836900411,
-                    user_agent: Cow::Borrowed("/Satoshi:0.7.2/"),
-                    start_height: 212672
-                }
-            }
-        );
-        assert_eq!(0, rem.len());
-    }
 
     fn do_test<'a, T>(example_bin: impl IntoIterator<Item = &'a str>, expected: T)
     where
@@ -729,5 +640,51 @@ mod tests {
                 checksum: [0x35, 0x8d, 0x49, 0x32],
             },
         )
+    }
+
+    #[test]
+    fn test_string() {
+        do_test(
+            ["0F 2F 53 61 74 6F 73 68 69 3A 30 2E 37 2E 32 2F"],
+            String::from("/Satoshi:0.7.2/"),
+        )
+    }
+
+    #[test]
+    fn test_version() {
+        do_test(
+            [
+                "62 EA 00 00",             // - 60002 (protocol version 60002)
+                "01 00 00 00 00 00 00 00", // - 1 (NODE_NETWORK services)
+                "11 B2 D0 50 00 00 00 00", // - Tue Dec 18 10:12:33 PST 2012
+                "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF 00 00 00 00 00 00", // - Recipient address info - see Network Address
+                "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF 00 00 00 00 00 00", // - Sender address info - see Network Address
+                "3B 2E B3 5D 8C E6 17 65", // - Node ID
+                "0F 2F 53 61 74 6F 73 68 69 3A 30 2E 37 2E 32 2F", // - "/Satoshi:0.7.2/" sub-version string (string is 15 bytes long)
+                "C0 3E 03 00", // - Last block sending node has is block #212672
+            ],
+            Version::Supports106 {
+                version: 60002.try_into().unwrap(),
+                fields: VersionFieldsMandatory {
+                    services: crate::constants::Services::NodeNetwork.into(),
+                    timestamp: "2012-12-18T18:12:33".parse().unwrap(),
+                    receiver: NetworkAddressWithoutTime {
+                        services: crate::constants::Services::NodeNetwork.into(),
+                        ipv6: std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(),
+                        port: 0,
+                    },
+                },
+                fields_106: VersionFields106 {
+                    sender: NetworkAddressWithoutTime {
+                        services: crate::constants::Services::NodeNetwork.into(),
+                        ipv6: std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(),
+                        port: 0,
+                    },
+                    nonce: 7284544412836900411,
+                    user_agent: String::from("/Satoshi:0.7.2/"),
+                    start_height: 212672,
+                },
+            },
+        );
     }
 }
