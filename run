@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -o nounset -o xtrace
+
+trap exit INT
+
 declare -a ips=(
     104.248.60.35
     18.27.79.17
@@ -30,5 +33,5 @@ declare -a ips=(
 
 for ip in "${ips[@]}"
 do
-    timeout 2 cargo run -- do-handshake "$ip:${port:-8333}"
+    timeout 2 cargo run --quiet -- do-handshake "$ip:${port:-8333}"
 done
