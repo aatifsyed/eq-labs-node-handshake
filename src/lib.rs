@@ -1,5 +1,7 @@
 use std::{mem, net, str};
 
+pub mod protocol;
+
 /// Attempt to deserialize this struct in accordance to the bitcoin protocol.
 // The bitcoin protocol has variable-length fields, so we can't just use interpret structs with
 // e.g [zerocopy::FromBytes]. Our implentation builds on [nom].
