@@ -166,9 +166,12 @@ pub mod wire {
 
     /// Decode and encode this struct on the wire according to the bitcoin protocol.
     /// This is for bit interpretation and *not* validation, as far as possible.
-    pub trait Transcode<'a, IResultErrT: ParseError<'a>> {
+    // Generic over lifetime so we can impl for borrowed data
+    pub trait Transcode<'a> {
         /// Attempt to deserialize this struct.
-        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT>
+        fn parse<IResultErrT: ParseError<'a>>(
+            input: &'a [u8],
+        ) -> nom::IResult<&'a [u8], Self, IResultErrT>
         where
             Self: Sized;
         /// The length of this struct when serialized.
@@ -201,7 +204,7 @@ pub mod wire {
             }
 
             #[automatically_derived]
-            impl<'__input, $($($struct_lifetime)?,)? IResultErrT: ParseError<'__input>> Transcode<'__input, IResultErrT> for $struct_name$(<$($struct_lifetime)?>)?
+            impl<'__input, $($($struct_lifetime)?,)?> Transcode<'__input> for $struct_name$(<$($struct_lifetime)?>)?
             $(
                 where
                 $( // allow struct_lifetime to have its own name
@@ -210,12 +213,12 @@ pub mod wire {
                 )?
             )?
             {
-                fn parse(
+                fn parse<IResultErrT: ParseError<'__input>>(
                     input: &'__input [u8],
                 ) -> nom::IResult<&'__input [u8], $struct_name$(<$($struct_lifetime)?>)?, IResultErrT> {
                     nom::sequence::tuple((
                         // We must refer to $field_ty here to get the macro to repeat as desired
-                        $(<$field_ty as Transcode<IResultErrT>>::parse,)*
+                        $(<$field_ty as Transcode>::parse,)*
                     )).map(
                         |(
                             $($field_name,)*
@@ -228,11 +231,11 @@ pub mod wire {
 
                 fn deparsed_len(&self) -> usize {
                     [
-                        $(<$field_ty as Transcode<IResultErrT>>::deparsed_len(&self.$field_name),)*
+                        $(<$field_ty as Transcode>::deparsed_len(&self.$field_name),)*
                     ].into_iter().sum()
                 }
                 fn deparse(&self, output: &mut [u8]) {
-                    $(let output = <$field_ty as TranscodeExt<IResultErrT>>::deparse_into_and_advance(
+                    $(let output = <$field_ty as TranscodeExt>::deparse_into_and_advance(
                         &self.$field_name,
                         output
                     );)*
@@ -340,8 +343,10 @@ pub mod wire {
         }
     }
 
-    impl<'a, IResultErrT: ParseError<'a>> Transcode<'a, IResultErrT> for VarInt {
-        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT> {
+    impl<'a> Transcode<'a> for VarInt {
+        fn parse<IResultErrT: ParseError<'a>>(
+            input: &'a [u8],
+        ) -> nom::IResult<&'a [u8], Self, IResultErrT> {
             use nom::{
                 bytes::streaming::tag,
                 number::streaming::{le_u16, le_u32, le_u64, le_u8},
@@ -408,8 +413,10 @@ pub mod wire {
         }
     }
 
-    impl<'a, IResultErrT: ParseError<'a>> Transcode<'a, IResultErrT> for VarStr<'a> {
-        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], VarStr<'a>, IResultErrT> {
+    impl<'a> Transcode<'a> for VarStr<'a> {
+        fn parse<IResultErrT: ParseError<'a>>(
+            input: &'a [u8],
+        ) -> nom::IResult<&'a [u8], VarStr<'a>, IResultErrT> {
             let (rem, len) = VarInt::parse(input)?;
             nom::bytes::streaming::take(len.0)
                 .map_res(std::str::from_utf8)
@@ -418,13 +425,10 @@ pub mod wire {
         }
 
         fn deparsed_len(&self) -> usize {
-            <VarInt as Transcode<IResultErrT>>::deparsed_len(&self.len_var_int()) + self.0.len()
+            self.len_var_int().deparsed_len() + self.0.len()
         }
         fn deparse(&self, output: &mut [u8]) {
-            let output = <VarInt as TranscodeExt<IResultErrT>>::deparse_into_and_advance(
-                &self.len_var_int(),
-                output,
-            );
+            let output = self.len_var_int().deparse_into_and_advance(output);
             self.0.write_to_prefix(output).unwrap()
         }
     }
@@ -461,8 +465,10 @@ pub mod wire {
         Supports70001(Version70001<'a>),
     }
 
-    impl<'a, IResultErrT: ParseError<'a>> Transcode<'a, IResultErrT> for Version<'a> {
-        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT> {
+    impl<'a> Transcode<'a> for Version<'a> {
+        fn parse<IResultErrT: ParseError<'a>>(
+            input: &'a [u8],
+        ) -> nom::IResult<&'a [u8], Self, IResultErrT> {
             nom::branch::alt((
                 VersionBasic::parse
                     .verify(|v| v.fields_mandatory.version.get() < 106)
@@ -477,23 +483,17 @@ pub mod wire {
 
         fn deparsed_len(&self) -> usize {
             match self {
-                Version::Basic(v) => <VersionBasic as Transcode<IResultErrT>>::deparsed_len(v),
-                Version::Supports106(v) => <Version106 as Transcode<IResultErrT>>::deparsed_len(v),
-                Version::Supports70001(v) => {
-                    <Version70001 as Transcode<IResultErrT>>::deparsed_len(v)
-                }
+                Version::Basic(v) => v.deparsed_len(),
+                Version::Supports106(v) => v.deparsed_len(),
+                Version::Supports70001(v) => v.deparsed_len(),
             }
         }
 
         fn deparse(&self, output: &mut [u8]) {
             match self {
-                Version::Basic(v) => <VersionBasic as Transcode<IResultErrT>>::deparse(v, output),
-                Version::Supports106(v) => {
-                    <Version106 as Transcode<IResultErrT>>::deparse(v, output)
-                }
-                Version::Supports70001(v) => {
-                    <Version70001 as Transcode<IResultErrT>>::deparse(v, output)
-                }
+                Version::Basic(v) => v.deparse(output),
+                Version::Supports106(v) => v.deparse(output),
+                Version::Supports70001(v) => v.deparse(output),
             }
         }
     }
@@ -505,29 +505,27 @@ pub mod wire {
         pub body: BodyT,
     }
 
-    impl<'a, IResultErrT: ParseError<'a>, BodyT> Transcode<'a, IResultErrT> for Frame<BodyT>
+    impl<'a, BodyT> Transcode<'a> for Frame<BodyT>
     where
-        BodyT: Transcode<'a, IResultErrT>,
+        BodyT: Transcode<'a>,
     {
         /// Does *not* validate checksum or length - actual frame chunking is not our responsibility
-        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT> {
-            let (rest, header) = <Header as Transcode<IResultErrT>>::parse(input)?;
-            let (rest, body) = <BodyT as Transcode<IResultErrT>>::parse(rest)?;
+        fn parse<IResultErrT: ParseError<'a>>(
+            input: &'a [u8],
+        ) -> nom::IResult<&'a [u8], Self, IResultErrT> {
+            let (rest, header) = Header::parse(input)?;
+            let (rest, body) = BodyT::parse(rest)?;
             Ok((rest, Frame { header, body }))
         }
 
         fn deparsed_len(&self) -> usize {
-            <Header as Transcode<IResultErrT>>::deparsed_len(&self.header)
-                + <BodyT as Transcode<IResultErrT>>::deparsed_len(&self.body)
+            self.header.deparsed_len() + self.body.deparsed_len()
         }
 
         /// Does *not* set checksum or length
         fn deparse(&self, output: &mut [u8]) {
-            let output = <Header as TranscodeExt<IResultErrT>>::deparse_into_and_advance(
-                &self.header,
-                output,
-            );
-            <BodyT as TranscodeExt<IResultErrT>>::deparse_into_and_advance(&self.body, output);
+            let output = self.header.deparse_into_and_advance(output);
+            self.body.deparse_into_and_advance(output);
         }
     }
 
@@ -540,8 +538,8 @@ pub mod wire {
         ($($ty:ty $({ $array_len:ident })?),* $(,)?) => {
             $(
                 #[automatically_derived]
-                impl<'a, IResultErrT: ParseError<'a> $(, const $array_len: usize)?> Transcode<'a, IResultErrT> for $ty {
-                    fn parse(input: &'a [u8]) -> nom::IResult<&'a[u8], Self, IResultErrT> {
+                impl<'a $(, const $array_len: usize)?> Transcode<'a> for $ty {
+                    fn parse<IResultErrT: ParseError<'a>>(input: &'a [u8]) -> nom::IResult<&'a[u8], Self, IResultErrT> {
                         match <$ty as zerocopy::FromBytes>::read_from_prefix(input) {
                             Some(t) => Ok((&input[std::mem::size_of::<$ty>()..], t)),
                             None => Err(nom::Err::Incomplete(nom::Needed::new(
@@ -568,8 +566,10 @@ pub mod wire {
 
     transcode_primitive!(U32le, U64le, U128netwk, U16netwk, I32le, I64le, [u8; N] { N });
 
-    impl<'a, IResultErrT: ParseError<'a>> Transcode<'a, IResultErrT> for bool {
-        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT> {
+    impl<'a> Transcode<'a> for bool {
+        fn parse<IResultErrT: ParseError<'a>>(
+            input: &'a [u8],
+        ) -> nom::IResult<&'a [u8], Self, IResultErrT> {
             use nom::bytes::streaming::tag;
             tag(&[0x00])
                 .value(false)
@@ -605,7 +605,7 @@ pub mod wire {
     {
     }
 
-    trait TranscodeExt<'a, IResultErrT: ParseError<'a>>: Transcode<'a, IResultErrT> {
+    trait TranscodeExt<'a>: Transcode<'a> {
         fn deparse_into_and_advance<'output>(
             &self,
             output: &'output mut [u8],
@@ -618,10 +618,7 @@ pub mod wire {
         }
     }
 
-    impl<'a, IResultErrT: ParseError<'a>, T> TranscodeExt<'a, IResultErrT> for T where
-        T: Transcode<'a, IResultErrT>
-    {
-    }
+    impl<'a, T> TranscodeExt<'a> for T where T: Transcode<'a> {}
 
     #[cfg(test)]
     mod transcoding {
@@ -643,11 +640,11 @@ pub mod wire {
 
         fn do_test<'example, T>(example_bin: &'example [u8], expected: T)
         where
-            T: PartialEq + fmt::Debug + Transcode<'example, nom::error::Error<&'example [u8]>>,
+            T: PartialEq + fmt::Debug + Transcode<'example>,
         {
             use pretty_assertions::assert_eq;
 
-            let (_, parsed_bin) = T::parse
+            let (_, parsed_bin) = T::parse::<nom::error::Error<_>>
                 .all_consuming()
                 .parse(example_bin)
                 .expect("failed to completely parse the example");
