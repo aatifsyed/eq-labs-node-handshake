@@ -2,7 +2,6 @@ use std::{cmp, io, mem};
 
 use bitcoin_hashes::Hash as _;
 use bytes::Buf as _;
-use nom_supreme::ParserExt as _;
 use zerocopy::FromBytes as _;
 
 pub struct Message {
@@ -142,54 +141,69 @@ impl tokio_util::codec::Decoder for Decoder {
     }
 }
 
-trait HasBitcoinProtocolParser<'a, IResultErrT>: Sized {
-    type Parser: nom::Parser<&'a [u8], Self, IResultErrT>;
-    fn parser() -> Self::Parser;
-}
-
-#[derive(Debug)]
-struct FromBytesParser<FromBytesT>(std::marker::PhantomData<FromBytesT>);
-impl<FromBytesT> Default for FromBytesParser<FromBytesT> {
-    fn default() -> Self {
-        Self(Default::default())
-    }
-}
-
-impl<'a, FromBytesT, IResultErrT> nom::Parser<&'a [u8], FromBytesT, IResultErrT>
-    for FromBytesParser<FromBytesT>
-where
-    FromBytesT: zerocopy::FromBytes,
-{
-    fn parse(&mut self, input: &'a [u8]) -> nom::IResult<&'a [u8], FromBytesT, IResultErrT> {
-        match FromBytesT::read_from_prefix(input) {
-            Some(t) => Ok((&input[mem::size_of::<FromBytesT>()..], t)),
-            None => Err(nom::Err::Incomplete(nom::Needed::new(
-                input.len() - mem::size_of::<FromBytesT>(),
-            ))),
-        }
-    }
-}
-
-impl<'a, IResultErrT, FromBytesT> HasBitcoinProtocolParser<'a, IResultErrT> for FromBytesT
-where
-    FromBytesT: zerocopy::FromBytes,
-{
-    type Parser = FromBytesParser<FromBytesT>;
-    fn parser() -> Self::Parser {
-        Self::Parser::default()
-    }
-}
-
 /// Wire representations.
+/// Endianness conversions are not done while parsing for the most part, we just store that information in the type system.
 ///
 /// Almost all integers are encoded in little endian. Only IP or port number are encoded big endian. All field sizes are numbers of bytes.
-/// Endianness conversions are not done while parsing, we just store that information in the type system.
+// https://en.bitcoin.it/wiki/Protocol_documentation#Common_structures
 mod wire {
-    use nom::Parser;
-    pub use zerocopy::{
+    use nom_supreme::ParserExt as _;
+    use std::mem;
+    use zerocopy::{
         little_endian::{I32 as I32le, I64 as I64le, U32 as U32le, U64 as U64le},
         network_endian::{U128 as U128netwk, U16 as U16netwk},
     };
+
+    // bargain bucket derive macro
+    macro_rules! transcode_each_field {
+        // Capture struct definition
+        (
+            $(#[$struct_meta:meta])*
+            $struct_vis:vis struct $struct_name:ident$(<$struct_lifetime:lifetime>)? {
+                $(
+                    $(#[$field_meta:meta])*
+                    $field_vis:vis $field_name:ident: $field_ty:ty,
+                )*
+            }
+        ) => {
+            // Passthrough the struct definition
+            $(#[$struct_meta])*
+            $struct_vis struct $struct_name$(<$struct_lifetime>)? {
+                $(
+                    $(#[$field_meta])*
+                    $field_vis $field_name: $field_ty,
+                )*
+            }
+
+            #[automatically_derived]
+            impl<'__input, $($struct_lifetime,)? IResultErrT> nom::Parser<&'__input [u8], $struct_name$(<$struct_lifetime>)?, IResultErrT> for Transcoder
+            where
+                $( // allow struct_lifetime to have its own name
+                    $struct_lifetime: '__input,
+                    '__input: $struct_lifetime,
+                )?
+                // common bounds
+                IResultErrT: nom::error::ParseError<&'__input [u8]>
+                    + nom::error::FromExternalError<&'__input [u8], std::str::Utf8Error>,
+            {
+                fn parse(
+                    &mut self, input: &'__input [u8],
+                ) -> nom::IResult<&'__input [u8], $struct_name$(<$struct_lifetime>)?, IResultErrT> {
+                    nom::sequence::tuple((
+                        // We must refer to $field_ty here to get the macro to repeat as desired
+                        $(Self::parse_ty::<$field_ty, IResultErrT>(),)*
+                    )).map(
+                        |(
+                            $($field_name,)*
+                        )| $struct_name {
+                            $($field_name,)*
+                        },
+                    )
+                    .parse(input)
+                }
+            }
+        };
+    }
 
     /// Message header for all bitcoin protocol packets
     // https://en.bitcoin.it/wiki/Protocol_documentation#Message_structure
@@ -205,6 +219,7 @@ mod wire {
         /// First 4 bytes of sha256(sha256(payload))
         pub checksum: [u8; 4],
     }
+    impl TranscodeWithBytes for Header {}
 
     /// When a network address is needed somewhere, this structure is used. Network addresses are not prefixed with a timestamp in the version message.
     // https://en.bitcoin.it/wiki/Protocol_documentation#Network_address
@@ -219,6 +234,7 @@ mod wire {
         /// port number, network byte order
         pub port: U16netwk,
     }
+    impl TranscodeWithBytes for NetworkAddressWithoutTime {}
 
     /// Fields present in all version packets
     // https://en.bitcoin.it/wiki/Protocol_documentation#version
@@ -234,7 +250,9 @@ mod wire {
         /// The network address of the node receiving this message.
         pub receiver: NetworkAddressWithoutTime,
     }
+    impl TranscodeWithBytes for VersionFieldsMandatory {}
 
+    transcode_each_field! {
     /// Fields present in all version packets at or after version 106
     // https://en.bitcoin.it/wiki/Protocol_documentation#version
     #[derive(Debug, Clone, PartialEq, Hash)]
@@ -250,38 +268,10 @@ mod wire {
         pub user_agent: VarStr<'a>,
         /// The last block received by the emitting node
         pub start_height: U32le,
-    }
+    }}
 
-    impl<'a, IResultErrT> super::HasBitcoinProtocolParser<'a, IResultErrT> for VersionFields106<'a>
-    where
-        IResultErrT: nom::error::ParseError<&'a [u8]>
-            + nom::error::FromExternalError<&'a [u8], VarIntTooWide>
-            + nom::error::FromExternalError<&'a [u8], std::str::Utf8Error>
-            + 'a,
-    {
-        type Parser = Box<dyn nom::Parser<&'a [u8], Self, IResultErrT> + 'a>;
-
-        fn parser() -> Self::Parser {
-            Box::new(
-                nom::sequence::tuple(
-                    (
-                        <NetworkAddressWithoutTime as super::HasBitcoinProtocolParser<
-                            IResultErrT,
-                        >>::parser(),
-                        <U64le as super::HasBitcoinProtocolParser<IResultErrT>>::parser(),
-                        <VarStr as super::HasBitcoinProtocolParser<IResultErrT>>::parser(),
-                        <U32le as super::HasBitcoinProtocolParser<IResultErrT>>::parser(),
-                    ),
-                )
-                .map(|(sender, nonce, user_agent, start_height)| Self {
-                    sender,
-                    nonce,
-                    user_agent,
-                    start_height,
-                }),
-            )
-        }
-    }
+    impl TranscodeWithBytes for U64le {}
+    impl TranscodeWithBytes for U32le {}
 
     /// Fields present in all version packets at or after version 70001
     // https://en.bitcoin.it/wiki/Protocol_documentation#version
@@ -291,141 +281,108 @@ mod wire {
         /// Whether the remote peer should announce relayed transactions or not, see BIP 0037
         pub relay: bool,
     }
+    impl TranscodeWithBytes for VersionFields70001 {}
 
     /// Integer can be encoded depending on the represented value to save space.
     /// Variable length integers always precede an array/vector of a type of data that may vary in length.
     /// Longer numbers are encoded in little endian.
     // https://en.bitcoin.it/wiki/Protocol_documentation#Variable_length_integer
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct VarInt {
-        pub inner: u64,
-    }
+    pub struct VarInt(pub u64);
 
-    #[cfg(target_pointer_width = "64")]
-    impl From<usize> for VarInt {
-        fn from(value: usize) -> Self {
-            Self {
-                inner: value as u64,
-            }
-        }
-    }
-
-    #[derive(Debug, thiserror::Error)]
-    #[error(
-        "var_int with value {inner} was {actual_width} bytes wide encoded, but should have been stored in fewer bytes"
-    )]
-    pub struct VarIntTooWide {
-        pub inner: u64,
-        pub actual_width: usize,
-    }
-
-    #[derive(Debug, Default)]
-    pub struct VarIntParser;
-
-    /// Check that `inner` couldn't be be stored in `WidthT` bytes
-    fn check_varint<WidthT>(inner: impl Into<u64>) -> Result<VarInt, VarIntTooWide>
+    impl<T> From<T> for VarInt
     where
-        WidthT: num::Bounded + Into<u64>,
+        T: Into<u64>,
     {
-        let inner = inner.into();
-        if inner > WidthT::max_value().into() {
-            Ok(VarInt { inner })
-        } else {
-            Err(VarIntTooWide {
-                inner,
-                actual_width: std::mem::size_of::<WidthT>(),
-            })
-        }
-    }
-
-    impl<'a, IResultErrT> nom::Parser<&'a [u8], VarInt, IResultErrT> for VarIntParser
-    where
-        IResultErrT: nom::error::ParseError<&'a [u8]>
-            + nom::error::FromExternalError<&'a [u8], VarIntTooWide>,
-    {
-        fn parse(&mut self, input: &'a [u8]) -> nom::IResult<&'a [u8], VarInt, IResultErrT> {
-            use nom::{
-                combinator::map_res,
-                number::streaming::{le_u16, le_u32, le_u64, le_u8},
-            };
-
-            let (rem, first_byte) = le_u8(input)?;
-            match first_byte {
-                // 0xFF followed by the length as uint64_t
-                0xFF => map_res(le_u64, check_varint::<u32>)(rem),
-                // 0xFE followed by the length as uint32_t
-                0xFE => map_res(le_u32, check_varint::<u16>)(rem),
-                // 0xFD followed by the length as uint16_t
-                0xFD => map_res(le_u16, |inner| {
-                    let inner = inner.into();
-                    if inner < 0xFD {
-                        Err(VarIntTooWide {
-                            inner,
-                            actual_width: 2,
-                        })
-                    } else {
-                        Ok(VarInt { inner })
-                    }
-                })(rem),
-                inner => Ok((
-                    rem,
-                    VarInt {
-                        inner: inner.into(),
-                    },
-                )),
-            }
-        }
-    }
-
-    impl<'a, IResultErrT> super::HasBitcoinProtocolParser<'a, IResultErrT> for VarInt
-    where
-        IResultErrT: nom::error::ParseError<&'a [u8]>
-            + nom::error::FromExternalError<&'a [u8], VarIntTooWide>,
-    {
-        type Parser = VarIntParser;
-
-        fn parser() -> Self::Parser {
-            Self::Parser::default()
+        fn from(value: T) -> Self {
+            Self(value.into())
         }
     }
 
     /// Variable length string can be stored using a variable length integer followed by the string itself.
     // https://en.bitcoin.it/wiki/Protocol_documentation#Variable_length_string
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct VarStr<'a>(&'a str);
+    pub struct VarStr<'a>(pub &'a str);
 
-    #[derive(Debug, Default)]
-    pub struct VarStrParser;
+    /// Seal for transcoding using [zerocopy::FromBytes]/[zerocopy::AsBytes].
+    // Required for specialising on [bool]
+    trait TranscodeWithBytes {}
 
-    impl<'a, IResultErrT> nom::Parser<&'a [u8], VarStr<'a>, IResultErrT> for VarStrParser
+    struct Transcoder;
+
+    impl<'a, FromBytesT, IResultErrT> nom::Parser<&'a [u8], FromBytesT, IResultErrT> for Transcoder
     where
-        IResultErrT: nom::error::ParseError<&'a [u8]>
-            + nom::error::FromExternalError<&'a [u8], VarIntTooWide>
-            + nom::error::FromExternalError<&'a [u8], std::str::Utf8Error>,
+        FromBytesT: zerocopy::FromBytes + TranscodeWithBytes,
     {
-        fn parse(&mut self, input: &'a [u8]) -> nom::IResult<&'a [u8], VarStr<'a>, IResultErrT> {
-            let (rem, length) =
-                <VarInt as super::HasBitcoinProtocolParser<IResultErrT>>::parser().parse(input)?;
-            let (rem, s) = nom::combinator::map_res(
-                // should fail to compile on 32-bit platforms, as nom::traits::ToUsize isn't implemented for u64 on those platforms
-                // so we should be arithmetically safe
-                nom::bytes::streaming::take(length.inner),
-                std::str::from_utf8,
-            )(rem)?;
-            Ok((rem, VarStr(s)))
+        fn parse(&mut self, input: &'a [u8]) -> nom::IResult<&'a [u8], FromBytesT, IResultErrT> {
+            match FromBytesT::read_from_prefix(input) {
+                Some(t) => Ok((&input[mem::size_of::<FromBytesT>()..], t)),
+                None => Err(nom::Err::Incomplete(nom::Needed::new(
+                    input.len() - mem::size_of::<FromBytesT>(),
+                ))),
+            }
         }
     }
 
-    impl<'a, IResultErrT> super::HasBitcoinProtocolParser<'a, IResultErrT> for VarStr<'a>
+    impl<'a, IResultErrT> nom::Parser<&'a [u8], bool, IResultErrT> for Transcoder
+    where
+        IResultErrT: nom::error::ParseError<&'a [u8]>,
+    {
+        fn parse(&mut self, input: &'a [u8]) -> nom::IResult<&'a [u8], bool, IResultErrT> {
+            use nom::bytes::streaming::tag;
+            tag(&[0x00])
+                .value(true)
+                .or(tag(&[0x1]).value(false))
+                .parse(input)
+        }
+    }
+
+    impl<'a, IResultErrT> nom::Parser<&'a [u8], VarInt, IResultErrT> for Transcoder
+    where
+        IResultErrT: nom::error::ParseError<&'a [u8]>,
+    {
+        fn parse(&mut self, input: &'a [u8]) -> nom::IResult<&'a [u8], VarInt, IResultErrT> {
+            use nom::{
+                bytes::streaming::tag,
+                number::streaming::{le_u16, le_u32, le_u64, le_u8},
+                sequence::preceded,
+            };
+            nom::combinator::fail
+                .or(preceded(tag(&[0xFF]), le_u64)
+                    .verify(|u| *u > u32::MAX.into())
+                    .map(VarInt::from))
+                .or(preceded(tag(&[0xFE]), le_u32)
+                    .verify(|u| *u > u16::MAX.into())
+                    .map(VarInt::from))
+                .or(preceded(tag(&[0xFD]), le_u16)
+                    .verify(|u| *u > u8::MAX.into())
+                    .map(VarInt::from))
+                .or(le_u8.map(VarInt::from))
+                .parse(input)
+        }
+    }
+
+    impl Transcoder {
+        /// Implementation detail of [transcode_each_field]
+        fn parse_ty<'a, T, IResultErrT>() -> impl nom::Parser<&'a [u8], T, IResultErrT>
+        where
+            Self: nom::Parser<&'a [u8], T, IResultErrT>,
+        {
+            Self
+        }
+    }
+
+    impl<'a, IResultErrT> nom::Parser<&'a [u8], VarStr<'a>, IResultErrT> for Transcoder
     where
         IResultErrT: nom::error::ParseError<&'a [u8]>
-            + nom::error::FromExternalError<&'a [u8], VarIntTooWide>
             + nom::error::FromExternalError<&'a [u8], std::str::Utf8Error>,
     {
-        type Parser = VarStrParser;
-
-        fn parser() -> Self::Parser {
-            Self::Parser::default()
+        fn parse(&mut self, input: &'a [u8]) -> nom::IResult<&'a [u8], VarStr<'a>, IResultErrT> {
+            let (rem, len) = Self::parse_ty::<VarInt, _>().parse(input)?;
+            nom::bytes::streaming::take(len.0)
+                .map_res(std::str::from_utf8)
+                .map(VarStr)
+                .parse(rem)
         }
     }
 }
@@ -480,135 +437,4 @@ mod constants {
         }
         commands!(VERSION / Version = "version", VERACK / Verack = "verack");
     }
-}
-
-mod dynamic {
-    use nom::{
-        combinator::map_res,
-        number::streaming::{le_u16, le_u32, le_u64, le_u8},
-    };
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct VarInt {
-        pub inner: u64,
-    }
-
-    #[cfg(target_pointer_width = "64")]
-    impl From<usize> for VarInt {
-        fn from(value: usize) -> Self {
-            Self {
-                inner: value as u64,
-            }
-        }
-    }
-
-    #[derive(Debug, thiserror::Error)]
-    #[error(
-        "var_int with value {inner} was {actual_width} bytes wide encoded, but should have been stored in fewer bytes"
-    )]
-    pub struct VarIntTooWide {
-        pub inner: u64,
-        pub actual_width: usize,
-    }
-
-    /// Check that `inner` couldn't be be stored in `WidthT` bytes
-    fn check_varint<WidthT>(inner: impl Into<u64>) -> Result<VarInt, VarIntTooWide>
-    where
-        WidthT: num::Bounded + Into<u64>,
-    {
-        let inner = inner.into();
-        if inner > WidthT::max_value().into() {
-            Ok(VarInt { inner })
-        } else {
-            Err(VarIntTooWide {
-                inner,
-                actual_width: std::mem::size_of::<WidthT>(),
-            })
-        }
-    }
-
-    fn parse_varint<'a, IResultErrT>(
-        buffer: &'a [u8],
-    ) -> nom::IResult<&'a [u8], VarInt, IResultErrT>
-    where
-        IResultErrT: nom::error::ParseError<&'a [u8]>
-            + nom::error::FromExternalError<&'a [u8], VarIntTooWide>,
-    {
-        let (rem, first_byte) = le_u8(buffer)?;
-        match first_byte {
-            // 0xFF followed by the length as uint64_t
-            0xFF => map_res(le_u64, check_varint::<u32>)(rem),
-            // 0xFE followed by the length as uint32_t
-            0xFE => map_res(le_u32, check_varint::<u16>)(rem),
-            // 0xFD followed by the length as uint16_t
-            0xFD => map_res(le_u16, |inner| {
-                let inner = inner.into();
-                if inner < 0xFD {
-                    Err(VarIntTooWide {
-                        inner,
-                        actual_width: 2,
-                    })
-                } else {
-                    Ok(VarInt { inner })
-                }
-            })(rem),
-            inner => Ok((
-                rem,
-                VarInt {
-                    inner: inner.into(),
-                },
-            )),
-        }
-    }
-
-    #[cfg(test)]
-    mod var_int_tests {
-        use super::*;
-        #[test]
-        fn test_short() {
-            let (rem, var_int) = parse_varint::<nom::error::Error<_>>(&[0xFC]).unwrap();
-            assert_eq!(0, rem.len());
-            assert_eq!(252, var_int.inner);
-        }
-        #[test]
-        fn test_medium() {
-            let (rem, var_int) = parse_varint::<nom::error::Error<_>>(&[0xFD, 0xFF, 0x01]).unwrap();
-            assert_eq!(0, rem.len());
-            assert_eq!(511, var_int.inner);
-
-            parse_varint::<nom::error::Error<_>>(&[0xFD, 0x01, 0x00])
-                .expect_err("01 should be stored as a byte");
-        }
-    }
-
-    // impl Deparse for VarInt {
-    //     fn deparsed_len(&self) -> usize {
-    //         // a more direct translation of protocol documentation
-    //         #[allow(clippy::match_overlapping_arm)]
-    //         match self.inner {
-    //             ..=0xFE => 1,
-    //             ..=0xFFFF => 3,
-    //             ..=0xFFFF_FFFF => 5,
-    //             _ => 9,
-    //         }
-    //     }
-
-    //     fn deparse(&self, buffer: &mut [u8]) {
-    //         match self.inner {
-    //             small @ ..=0xFE => buffer[0] = small as u8,
-    //             medium @ ..=0xFFFF => {
-    //                 buffer[0] = 0xFD;
-    //                 frontfill(&u16::to_le_bytes(medium as _), &mut buffer[1..])
-    //             }
-    //             large @ ..=0xFFFF_FFFF => {
-    //                 buffer[0] = 0xFE;
-    //                 frontfill(&u32::to_le_bytes(large as _), &mut buffer[1..])
-    //             }
-    //             xlarge => {
-    //                 buffer[0] = 0xFF;
-    //                 frontfill(&u64::to_le_bytes(xlarge as _), &mut buffer[1..])
-    //             }
-    //         }
-    //     }
-    // }
 }
