@@ -187,7 +187,7 @@ pub mod wire {
         // Capture struct definition
         (
             $(#[$struct_meta:meta])*
-            $struct_vis:vis struct $struct_name:ident$(<$($struct_lifetime:lifetime>)?)? {
+            $struct_vis:vis struct $struct_name:ident$(<$struct_lifetime:lifetime>)? {
                 $(
                     $(#[$field_meta:meta])*
                     $field_vis:vis $field_name:ident: $field_ty:ty,
@@ -196,7 +196,7 @@ pub mod wire {
         ) => {
             // Passthrough the struct definition
             $(#[$struct_meta])*
-            $struct_vis struct $struct_name$(<$($struct_lifetime)?>)? {
+            $struct_vis struct $struct_name$(<$struct_lifetime>)? {
                 $(
                     $(#[$field_meta])*
                     $field_vis $field_name: $field_ty,
@@ -204,18 +204,17 @@ pub mod wire {
             }
 
             #[automatically_derived]
-            impl<'__input, $($($struct_lifetime)?,)?> Transcode<'__input> for $struct_name$(<$($struct_lifetime)?>)?
+            impl<'__input, $($struct_lifetime)?> Transcode<'__input> for $struct_name$(<$struct_lifetime>)?
             $(
+                // allow struct_lifetime to have its own name
                 where
-                $( // allow struct_lifetime to have its own name
                     $struct_lifetime: '__input,
                     '__input: $struct_lifetime,
-                )?
             )?
             {
                 fn parse<IResultErrT: ParseError<'__input>>(
                     input: &'__input [u8],
-                ) -> nom::IResult<&'__input [u8], $struct_name$(<$($struct_lifetime)?>)?, IResultErrT> {
+                ) -> nom::IResult<&'__input [u8], $struct_name$(<$struct_lifetime>)?, IResultErrT> {
                     nom::sequence::tuple((
                         // We must refer to $field_ty here to get the macro to repeat as desired
                         $(<$field_ty as Transcode>::parse,)*
