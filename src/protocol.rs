@@ -154,7 +154,7 @@ impl tokio_util::codec::Decoder for Decoder {
 //   - we achieve this with &strs, but not other structs
 //   - we could have safe "view structs" into owned buffers, but I'd only stoop to that in extreme
 //     performance environments
-mod wire {
+pub mod wire {
     use nom::Parser as _;
     use nom_supreme::ParserExt as _;
     use tap::Tap;
@@ -164,12 +164,27 @@ mod wire {
         AsBytes,
     };
 
+    /// Decode and encode this struct on the wire according to the bitcoin protocol.
+    /// This is for bit interpretation and *not* validation, as far as possible.
+    pub trait Transcode<'a, IResultErrT: ParseError<'a>> {
+        /// Attempt to deserialize this struct.
+        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT>
+        where
+            Self: Sized;
+        /// The length of this struct when serialized.
+        fn deparsed_len(&self) -> usize;
+        /// Deserialise this struct.
+        /// # Panics
+        /// Implementations may panic if `output.len() < self.deparsed_len()`
+        fn deparse(&self, output: &mut [u8]);
+    }
+
     // bargain bucket derive macro
     macro_rules! transcode_each_field {
         // Capture struct definition
         (
             $(#[$struct_meta:meta])*
-            $struct_vis:vis struct $struct_name:ident$(<$struct_lifetime:lifetime>)? {
+            $struct_vis:vis struct $struct_name:ident$(<$($struct_lifetime:lifetime>)?)? {
                 $(
                     $(#[$field_meta:meta])*
                     $field_vis:vis $field_name:ident: $field_ty:ty,
@@ -178,7 +193,7 @@ mod wire {
         ) => {
             // Passthrough the struct definition
             $(#[$struct_meta])*
-            $struct_vis struct $struct_name$(<$struct_lifetime>)? {
+            $struct_vis struct $struct_name$(<$($struct_lifetime)?>)? {
                 $(
                     $(#[$field_meta])*
                     $field_vis $field_name: $field_ty,
@@ -186,16 +201,18 @@ mod wire {
             }
 
             #[automatically_derived]
-            impl<'__input, $($struct_lifetime,)? IResultErrT: ParseError<'__input>> Transcode<'__input, IResultErrT> for $struct_name$(<$struct_lifetime>)?
-            $( // allow struct_lifetime to have its own name
+            impl<'__input, $($($struct_lifetime)?,)? IResultErrT: ParseError<'__input>> Transcode<'__input, IResultErrT> for $struct_name$(<$($struct_lifetime)?>)?
+            $(
                 where
+                $( // allow struct_lifetime to have its own name
                     $struct_lifetime: '__input,
                     '__input: $struct_lifetime,
+                )?
             )?
             {
                 fn parse(
                     input: &'__input [u8],
-                ) -> nom::IResult<&'__input [u8], $struct_name$(<$struct_lifetime>)?, IResultErrT> {
+                ) -> nom::IResult<&'__input [u8], $struct_name$(<$($struct_lifetime)?>)?, IResultErrT> {
                     nom::sequence::tuple((
                         // We must refer to $field_ty here to get the macro to repeat as desired
                         $(<$field_ty as Transcode<IResultErrT>>::parse,)*
@@ -224,6 +241,10 @@ mod wire {
             }
         };
     }
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // Structs transcribed from https://en.bitcoin.it/wiki/Protocol_documentation //
+    ////////////////////////////////////////////////////////////////////////////////
 
     transcode_each_field! {
     /// Message header for all bitcoin protocol packets
@@ -299,37 +320,9 @@ mod wire {
         pub relay: bool,
     }}
 
-    transcode_each_field! {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::AsBytes, zerocopy::FromBytes)]
-        #[repr(C)]
-        pub struct VersionBasic {
-            pub fields_mandatory: VersionFieldsMandatory,
-        }
-    }
-
-    transcode_each_field! {
-        #[derive(Debug, Clone, PartialEq, Hash)]
-        pub struct Version106<'a> {
-            pub fields_mandatory: VersionFieldsMandatory,
-            pub fields_106: VersionFields106<'a>,
-        }
-    }
-
-    transcode_each_field! {
-        #[derive(Debug, Clone, PartialEq, Hash)]
-        pub struct Version70001<'a> {
-            pub fields_mandatory: VersionFieldsMandatory,
-            pub fields_106: VersionFields106<'a>,
-            pub fields_70001: VersionFields70001,
-        }
-    }
-
-    #[derive(Debug, Clone, PartialEq, Hash)]
-    pub enum Version<'a> {
-        Basic(VersionBasic),
-        Supports106(Version106<'a>),
-        Supports70001(Version70001<'a>),
-    }
+    /////////////////////
+    // Fancier structs //
+    /////////////////////
 
     /// Integer can be encoded depending on the represented value to save space.
     /// Variable length integers always precede an array/vector of a type of data that may vary in length.
@@ -344,83 +337,6 @@ mod wire {
     {
         fn from(value: T) -> Self {
             Self(value.into())
-        }
-    }
-
-    /// Variable length string can be stored using a variable length integer followed by the string itself.
-    // https://en.bitcoin.it/wiki/Protocol_documentation#Variable_length_string
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct VarStr<'a>(pub &'a str);
-
-    impl VarStr<'_> {
-        /// # Panics
-        /// If `self.0.len() > u64::MAX`
-        pub fn len_var_int(&self) -> VarInt {
-            VarInt(self.0.len().try_into().expect("very large string"))
-        }
-    }
-
-    /// Common constraint for [nom::IResult]'s error type.
-    /// This is a single place to add further errors, and allows us to compose parsing automatically
-    pub trait ParseError<'a>:
-        nom::error::ParseError<&'a [u8]>
-        + nom::error::FromExternalError<&'a [u8], std::str::Utf8Error>
-    {
-    }
-    impl<'a, T> ParseError<'a> for T where
-        T: nom::error::ParseError<&'a [u8]>
-            + nom::error::FromExternalError<&'a [u8], std::str::Utf8Error>
-    {
-    }
-
-    /// Decoded and encoded this struct on the wire according to the bitcoin protocol.
-    pub trait Transcode<'a, IResultErrT: ParseError<'a>> {
-        /// Attempt to deserialize this struct.
-        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT>
-        where
-            Self: Sized;
-        /// The length of this struct when serialized.
-        fn deparsed_len(&self) -> usize;
-        /// Deserialise this struct.
-        /// # Panics
-        /// Implementations may panic if `output.len() < self.deparsed_len()`
-        fn deparse(&self, output: &mut [u8]);
-    }
-
-    trait TranscodeExt<'a, IResultErrT: ParseError<'a>>: Transcode<'a, IResultErrT> {
-        fn deparse_into_and_advance<'output>(
-            &self,
-            output: &'output mut [u8],
-        ) -> &'output mut [u8] {
-            self.deparse(output);
-            &mut output[self.deparsed_len()..]
-        }
-        fn deparse_to_vec(&self) -> Vec<u8> {
-            vec![0u8; self.deparsed_len()].tap_mut(|it| self.deparse(it))
-        }
-    }
-
-    impl<'a, IResultErrT: ParseError<'a>, T> TranscodeExt<'a, IResultErrT> for T where
-        T: Transcode<'a, IResultErrT>
-    {
-    }
-
-    impl<'a, IResultErrT: ParseError<'a>> Transcode<'a, IResultErrT> for bool {
-        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT> {
-            use nom::bytes::streaming::tag;
-            tag(&[0x00])
-                .value(false)
-                .or(tag(&[0x01]).value(true))
-                .parse(input)
-        }
-
-        fn deparsed_len(&self) -> usize {
-            std::mem::size_of::<Self>()
-        }
-
-        fn deparse(&self, output: &mut [u8]) {
-            self.write_to_prefix(output)
-                .expect("attempted to deparse into a buffer too small for bool")
         }
     }
 
@@ -479,6 +395,19 @@ mod wire {
         }
     }
 
+    /// Variable length string can be stored using a variable length integer followed by the string itself.
+    // https://en.bitcoin.it/wiki/Protocol_documentation#Variable_length_string
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct VarStr<'a>(pub &'a str);
+
+    impl VarStr<'_> {
+        /// # Panics
+        /// If `self.0.len() > u64::MAX`
+        pub fn len_var_int(&self) -> VarInt {
+            VarInt(self.0.len().try_into().expect("very large string"))
+        }
+    }
+
     impl<'a, IResultErrT: ParseError<'a>> Transcode<'a, IResultErrT> for VarStr<'a> {
         fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], VarStr<'a>, IResultErrT> {
             let (rem, len) = VarInt::parse(input)?;
@@ -498,6 +427,38 @@ mod wire {
             );
             self.0.write_to_prefix(output).unwrap()
         }
+    }
+
+    transcode_each_field! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::AsBytes, zerocopy::FromBytes)]
+        #[repr(C)]
+        pub struct VersionBasic {
+            pub fields_mandatory: VersionFieldsMandatory,
+        }
+    }
+
+    transcode_each_field! {
+        #[derive(Debug, Clone, PartialEq, Hash)]
+        pub struct Version106<'a> {
+            pub fields_mandatory: VersionFieldsMandatory,
+            pub fields_106: VersionFields106<'a>,
+        }
+    }
+
+    transcode_each_field! {
+        #[derive(Debug, Clone, PartialEq, Hash)]
+        pub struct Version70001<'a> {
+            pub fields_mandatory: VersionFieldsMandatory,
+            pub fields_106: VersionFields106<'a>,
+            pub fields_70001: VersionFields70001,
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Hash)]
+    pub enum Version<'a> {
+        Basic(VersionBasic),
+        Supports106(Version106<'a>),
+        Supports70001(Version70001<'a>),
     }
 
     impl<'a, IResultErrT: ParseError<'a>> Transcode<'a, IResultErrT> for Version<'a> {
@@ -537,6 +498,43 @@ mod wire {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::FromBytes)]
+    #[repr(C)]
+    pub struct Frame<BodyT> {
+        pub header: Header,
+        pub body: BodyT,
+    }
+
+    impl<'a, IResultErrT: ParseError<'a>, BodyT> Transcode<'a, IResultErrT> for Frame<BodyT>
+    where
+        BodyT: Transcode<'a, IResultErrT>,
+    {
+        /// Does *not* validate checksum or length - actual frame chunking is not our responsibility
+        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT> {
+            let (rest, header) = <Header as Transcode<IResultErrT>>::parse(input)?;
+            let (rest, body) = <BodyT as Transcode<IResultErrT>>::parse(rest)?;
+            Ok((rest, Frame { header, body }))
+        }
+
+        fn deparsed_len(&self) -> usize {
+            <Header as Transcode<IResultErrT>>::deparsed_len(&self.header)
+                + <BodyT as Transcode<IResultErrT>>::deparsed_len(&self.body)
+        }
+
+        /// Does *not* set checksum or length
+        fn deparse(&self, output: &mut [u8]) {
+            let output = <Header as TranscodeExt<IResultErrT>>::deparse_into_and_advance(
+                &self.header,
+                output,
+            );
+            <BodyT as TranscodeExt<IResultErrT>>::deparse_into_and_advance(&self.body, output);
+        }
+    }
+
+    ///////////////////////////////
+    // Primitive implementations //
+    ///////////////////////////////
+
     /// Transcode using [zerocopy::FromBytes]/[zerocopy::AsBytes]
     macro_rules! transcode_primitive {
         ($($ty:ty $({ $array_len:ident })?),* $(,)?) => {
@@ -569,6 +567,61 @@ mod wire {
     }
 
     transcode_primitive!(U32le, U64le, U128netwk, U16netwk, I32le, I64le, [u8; N] { N });
+
+    impl<'a, IResultErrT: ParseError<'a>> Transcode<'a, IResultErrT> for bool {
+        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT> {
+            use nom::bytes::streaming::tag;
+            tag(&[0x00])
+                .value(false)
+                .or(tag(&[0x01]).value(true))
+                .parse(input)
+        }
+
+        fn deparsed_len(&self) -> usize {
+            std::mem::size_of::<Self>()
+        }
+
+        fn deparse(&self, output: &mut [u8]) {
+            self.write_to_prefix(output)
+                .expect("attempted to deparse into a buffer too small for bool")
+        }
+    }
+
+    ///////////
+    // Utils //
+    ///////////
+
+    /// Common constraint for [nom::IResult]'s error type.
+    /// This is a single place to add further errors, and allows us to compose parsing automatically
+    pub trait ParseError<'a>:
+        nom::error::ParseError<&'a [u8]>
+        + nom::error::FromExternalError<&'a [u8], std::str::Utf8Error>
+    {
+    }
+
+    impl<'a, T> ParseError<'a> for T where
+        T: nom::error::ParseError<&'a [u8]>
+            + nom::error::FromExternalError<&'a [u8], std::str::Utf8Error>
+    {
+    }
+
+    trait TranscodeExt<'a, IResultErrT: ParseError<'a>>: Transcode<'a, IResultErrT> {
+        fn deparse_into_and_advance<'output>(
+            &self,
+            output: &'output mut [u8],
+        ) -> &'output mut [u8] {
+            self.deparse(output);
+            &mut output[self.deparsed_len()..]
+        }
+        fn deparse_to_vec(&self) -> Vec<u8> {
+            vec![0u8; self.deparsed_len()].tap_mut(|it| self.deparse(it))
+        }
+    }
+
+    impl<'a, IResultErrT: ParseError<'a>, T> TranscodeExt<'a, IResultErrT> for T where
+        T: Transcode<'a, IResultErrT>
+    {
+    }
 
     #[cfg(test)]
     mod transcoding {
@@ -681,11 +734,91 @@ mod wire {
                 }),
             );
         }
+
+        #[test]
+        fn version_with_header() {
+            do_test(
+                &hex2bin([
+                    // Message Header:
+                    "F9 BE B4 D9",                         //- Main network magic bytes
+                    "76 65 72 73 69 6F 6E 00 00 00 00 00", //- "version" command
+                    "64 00 00 00",                         //- Payload is 100 bytes long
+                    // BUG?(aatifsyed) I think this example from https://en.bitcoin.it/wiki/Protocol_documentation#version has the wrong checksum - see [checksum] test below
+                    "35 8d 49 32", // - payload checksum (internal byte order)
+                    // Version message:
+                    "62 EA 00 00",             // - 60002 (protocol version 60002)
+                    "01 00 00 00 00 00 00 00", // - 1 (NODE_NETWORK services)
+                    "11 B2 D0 50 00 00 00 00", // - Tue Dec 18 10:12:33 PST 2012
+                    "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF 00 00 00 00 00 00", // - Recipient address info - see Network Address
+                    "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF 00 00 00 00 00 00", // - Sender address info - see Network Address
+                    "3B 2E B3 5D 8C E6 17 65", // - Node ID
+                    "0F 2F 53 61 74 6F 73 68 69 3A 30 2E 37 2E 32 2F", // - "/Satoshi:0.7.2/" sub-version string (string is 15 bytes long)
+                    "C0 3E 03 00", // - Last block sending node has is block #212672
+                ]),
+                Frame {
+                    header: Header {
+                        magic: 0xD9B4BEF9.into(),
+                        command: *b"version\0\0\0\0\0",
+                        length: 100.into(),
+                        checksum: [0x35, 0x8d, 0x49, 0x32],
+                    },
+                    body: Version106 {
+                        fields_mandatory: VersionFieldsMandatory {
+                            version: 60002.into(),
+                            services: 1.into(),
+                            timestamp: 1355854353.into(),
+                            receiver: NetworkAddressWithoutTime {
+                                services: 1.into(),
+                                ipv6: std::net::Ipv4Addr::UNSPECIFIED
+                                    .to_ipv6_mapped()
+                                    .conv::<u128>()
+                                    .into(),
+                                port: 0.into(),
+                            },
+                        },
+                        fields_106: VersionFields106 {
+                            sender: NetworkAddressWithoutTime {
+                                services: 1.into(),
+                                ipv6: std::net::Ipv4Addr::UNSPECIFIED
+                                    .to_ipv6_mapped()
+                                    .conv::<u128>()
+                                    .into(),
+                                port: 0.into(),
+                            },
+                            nonce: 7284544412836900411.into(),
+                            user_agent: VarStr("/Satoshi:0.7.2/"),
+                            start_height: 212672.into(),
+                        },
+                    },
+                },
+            )
+        }
+
+        /// bug in example at https://en.bitcoin.it/wiki/Protocol_documentation#version
+        #[test]
+        #[should_panic]
+        fn test_checksum() {
+            let bin = hex2bin([
+                // Version message:
+                "62 EA 00 00",             // - 60002 (protocol version 60002)
+                "01 00 00 00 00 00 00 00", // - 1 (NODE_NETWORK services)
+                "11 B2 D0 50 00 00 00 00", // - Tue Dec 18 10:12:33 PST 2012
+                "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF 00 00 00 00 00 00", // - Recipient address info - see Network Address
+                "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF 00 00 00 00 00 00", // - Sender address info - see Network Address
+                "3B 2E B3 5D 8C E6 17 65", // - Node ID
+                "0F 2F 53 61 74 6F 73 68 69 3A 30 2E 37 2E 32 2F", // - "/Satoshi:0.7.2/" sub-version string (string is 15 bytes long)
+                "C0 3E 03 00", // - Last block sending node has is block #212672
+            ]);
+            let checksum = <bitcoin_hashes::sha256d::Hash as bitcoin_hashes::Hash>::hash(&bin);
+            assert_eq!(
+                [0x35, 0x8d, 0x49, 0x32], // from example
+                [checksum[0], checksum[1], checksum[2], checksum[3]],
+            )
+        }
     }
 }
 
-mod constants {
-    /// Allow [MessageBody::command] and [Message::parse] to use the same arrays
+pub mod constants {
     pub mod commands {
         use std::fmt;
 
@@ -733,5 +866,41 @@ mod constants {
             };
         }
         commands!(VERSION / Version = "version", VERACK / Verack = "verack");
+    }
+
+    #[derive(Debug, bitbag::BitBaggable, Clone, Copy, PartialEq, Eq, Hash)]
+    #[repr(u64)]
+    pub enum Services {
+        /// `NODE_NETWORK`
+        /// This node can be asked for full blocks instead of just headers.
+        NodeNetwork = 1,
+        /// `NODE_GETUTXO`
+        /// See BIP 0064.
+        NodeGetutxo = 2,
+        /// `NODE_BLOOM`
+        /// See BIP 0111.
+        NodeBloom = 4,
+        /// `NODE_WITNESS`
+        /// See BIP 0144.
+        NodeWitness = 8,
+        /// `NODE_XTHIN`
+        /// Never formally proposed (as a BIP), and discontinued. Was historically sporadically seen on the network.
+        NodeXthin = 16,
+        /// `NODE_COMPACT_FILTERS`
+        /// See BIP 0157.
+        NodeCompactFilters = 64,
+        /// `NODE_NETWORK_LIMITED`
+        /// See BIP 0159.
+        NodeNetworkLimited = 1024,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, num_enum::TryFromPrimitive)]
+    #[repr(u32)]
+    pub enum Magic {
+        Main = 0xD9B4BEF9,
+        Testnet = 0xDAB5BFFA,
+        Testnet3 = 0x0709110B,
+        Signet = 0x40CF030A,
+        Namecoin = 0xFEB4BEF9,
     }
 }
