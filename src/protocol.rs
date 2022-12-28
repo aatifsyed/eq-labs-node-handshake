@@ -146,8 +146,18 @@ impl tokio_util::codec::Decoder for Decoder {
 ///
 /// Almost all integers are encoded in little endian. Only IP or port number are encoded big endian. All field sizes are numbers of bytes.
 // https://en.bitcoin.it/wiki/Protocol_documentation#Common_structures
+//
+// Goals for this module are
+// - be fairly direct translations of the bitcoin documentations
+// - minimise the number of manual implementations, while still being correct
+// - allow zero-copy borrows from the source data
+//   - we achieve this with &strs, but not other structs
+//   - we could have safe "view structs" into owned buffers, but I'd only stoop to that in extreme
+//     performance environments
 mod wire {
+    use nom::Parser as _;
     use nom_supreme::ParserExt as _;
+    use tap::Tap;
     use zerocopy::{
         little_endian::{I32 as I32le, I64 as I64le, U16 as U16le, U32 as U32le, U64 as U64le},
         network_endian::{U128 as U128netwk, U16 as U16netwk},
@@ -176,22 +186,19 @@ mod wire {
             }
 
             #[automatically_derived]
-            impl<'__input, $($struct_lifetime,)? IResultErrT> nom::Parser<&'__input [u8], $struct_name$(<$struct_lifetime>)?, IResultErrT> for Transcoder
-            where
-                $( // allow struct_lifetime to have its own name
+            impl<'__input, $($struct_lifetime,)? IResultErrT: ParseError<'__input>> Transcode<'__input, IResultErrT> for $struct_name$(<$struct_lifetime>)?
+            $( // allow struct_lifetime to have its own name
+                where
                     $struct_lifetime: '__input,
                     '__input: $struct_lifetime,
-                )?
-                // common bounds
-                IResultErrT: nom::error::ParseError<&'__input [u8]>
-                    + nom::error::FromExternalError<&'__input [u8], std::str::Utf8Error>,
+            )?
             {
                 fn parse(
-                    &mut self, input: &'__input [u8],
+                    input: &'__input [u8],
                 ) -> nom::IResult<&'__input [u8], $struct_name$(<$struct_lifetime>)?, IResultErrT> {
                     nom::sequence::tuple((
                         // We must refer to $field_ty here to get the macro to repeat as desired
-                        $(Self::parser_for::<$field_ty, IResultErrT>(),)*
+                        $(<$field_ty as Transcode<IResultErrT>>::parse,)*
                     )).map(
                         |(
                             $($field_name,)*
@@ -201,18 +208,18 @@ mod wire {
                     )
                     .parse(input)
                 }
-            }
 
-            #[automatically_derived]
-            impl$(<$struct_lifetime>)? Deparse<$struct_name$(<$struct_lifetime>)?> for Transcoder {
-                fn deparsed_len(out: &$struct_name$(<$struct_lifetime>)?) -> usize {
+                fn deparsed_len(&self) -> usize {
                     [
-                        $(<Self as Deparse<$field_ty>>::deparsed_len(&out.$field_name),)*
+                        $(<$field_ty as Transcode<IResultErrT>>::deparsed_len(&self.$field_name),)*
                     ].into_iter().sum()
                 }
-                fn deparse(out: &$struct_name$(<$struct_lifetime>)?, buffer: &mut [u8]) {
-                    $(let buffer = Self::deparse_into_and_advance(&out.$field_name, buffer);)*
-                    let _ = buffer;
+                fn deparse(&self, output: &mut [u8]) {
+                    $(let output = <$field_ty as TranscodeExt<IResultErrT>>::deparse_into_and_advance(
+                        &self.$field_name,
+                        output
+                    );)*
+                    let _ = output;
                 }
             }
         };
@@ -241,7 +248,7 @@ mod wire {
     #[repr(C)]
     pub struct NetworkAddressWithoutTime {
         /// same service(s) listed in version.
-        pub services: U32le,
+        pub services: U64le,
         /// IPv6 address. Network byte order. The original client only supported IPv4 and only read the last 4 bytes to get the IPv4 address. However, the IPv4 address is written into the message as a 16 byte IPv4-mapped IPv6 address
         /// (12 bytes 00 00 00 00 00 00 00 00 00 00 FF FF, followed by the 4 bytes of the IPv4 address).
         pub ipv6: U128netwk,
@@ -269,7 +276,6 @@ mod wire {
     /// Fields present in all version packets at or after version 106
     // https://en.bitcoin.it/wiki/Protocol_documentation#version
     #[derive(Debug, Clone, PartialEq, Hash)]
-    #[repr(C)]
     pub struct VersionFields106<'a> {
         /// Field can be ignored.
         /// This used to be the network address of the node emitting this message, but most P2P implementations send 26 dummy bytes.
@@ -292,6 +298,38 @@ mod wire {
         /// Whether the remote peer should announce relayed transactions or not, see BIP 0037
         pub relay: bool,
     }}
+
+    transcode_each_field! {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::AsBytes, zerocopy::FromBytes)]
+        #[repr(C)]
+        pub struct VersionBasic {
+            pub fields_mandatory: VersionFieldsMandatory,
+        }
+    }
+
+    transcode_each_field! {
+        #[derive(Debug, Clone, PartialEq, Hash)]
+        pub struct Version106<'a> {
+            pub fields_mandatory: VersionFieldsMandatory,
+            pub fields_106: VersionFields106<'a>,
+        }
+    }
+
+    transcode_each_field! {
+        #[derive(Debug, Clone, PartialEq, Hash)]
+        pub struct Version70001<'a> {
+            pub fields_mandatory: VersionFieldsMandatory,
+            pub fields_106: VersionFields106<'a>,
+            pub fields_70001: VersionFields70001,
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Hash)]
+    pub enum Version<'a> {
+        Basic(VersionBasic),
+        Supports106(Version106<'a>),
+        Supports70001(Version70001<'a>),
+    }
 
     /// Integer can be encoded depending on the represented value to save space.
     /// Variable length integers always precede an array/vector of a type of data that may vary in length.
@@ -322,89 +360,72 @@ mod wire {
         }
     }
 
-    /// Implements nom::Parser for structs according to bitcoin's wire protocol
-    // Keeping all implementations on this struct simplifies lifetimes for borrowed data,
-    // ultimately allowing us to zerocopy for [VarStr] - see repo history.
-    //
-    // We could keep state on the Transcoder if we wanted to parameterise e.g maximum string lengths
-    struct Transcoder;
-
-    /// Serialize this `OutT` in accordance to the bitcoin protocol.
-    // This trait and its implementors are broadly inspired by fuschia's netstack3 traits, which do a
-    // kind of inside-out packet parsing.
-    // See https://github.com/aatifsyed/fuschia-nestack-hacking.
-    pub trait Deparse<OutT> {
-        /// The size of buffer required to deparse this struct (including all fields).
-        /// MUST be equal to the number of bytes deparsed into `buffer` in [Deparse::deparse].
-        fn deparsed_len(out: &OutT) -> usize;
-        /// Deparse this struct into a buffer.
-        /// Implementations may assume that `buffer.len() >= self.deparsed_len()`.
-        fn deparse(out: &OutT, buffer: &mut [u8]);
-    }
-
-    /// Transcode using [zerocopy::FromBytes]/[zerocopy::AsBytes]
-    macro_rules! transcode_primitive {
-        ($($ty:ty $({ $array_len:ident })?),* $(,)?) => {
-            $(
-                #[automatically_derived]
-                impl<'a, IResultErrT $(, const $array_len: usize)?> nom::Parser<&'a [u8], $ty, IResultErrT> for Transcoder {
-                    fn parse(&mut self, input: &'a [u8]) -> nom::IResult<&'a [u8], $ty, IResultErrT> {
-                        match <$ty as zerocopy::FromBytes>::read_from_prefix(input) {
-                            Some(t) => Ok((&input[std::mem::size_of::<$ty>()..], t)),
-                            None => Err(nom::Err::Incomplete(nom::Needed::new(
-                                input.len() - std::mem::size_of::<$ty>(),
-                            ))),
-                        }
-                    }
-                }
-
-                #[automatically_derived]
-                impl$(<const $array_len: usize>)? Deparse<$ty> for Transcoder {
-                    fn deparsed_len(_: &$ty) -> usize {
-                        std::mem::size_of::<$ty>()
-                    }
-                    fn deparse(out: &$ty, buffer: &mut [u8]) {
-                        <$ty as zerocopy::AsBytes>::write_to_prefix(out, buffer)
-                            .expect(concat!(
-                                "Transcoder attempted to deparse into a buffer too small for ",
-                                stringify!($ty)
-                            ))
-                    }
-                }
-            )*
-        };
-    }
-
-    transcode_primitive!(U32le, U64le, U128netwk, U16netwk, I32le, I64le, [u8; N] { N });
-
-    impl<'a, IResultErrT> nom::Parser<&'a [u8], bool, IResultErrT> for Transcoder
-    where
-        IResultErrT: nom::error::ParseError<&'a [u8]>,
+    /// Common constraint for [nom::IResult]'s error type.
+    /// This is a single place to add further errors, and allows us to compose parsing automatically
+    pub trait ParseError<'a>:
+        nom::error::ParseError<&'a [u8]>
+        + nom::error::FromExternalError<&'a [u8], std::str::Utf8Error>
     {
-        fn parse(&mut self, input: &'a [u8]) -> nom::IResult<&'a [u8], bool, IResultErrT> {
+    }
+    impl<'a, T> ParseError<'a> for T where
+        T: nom::error::ParseError<&'a [u8]>
+            + nom::error::FromExternalError<&'a [u8], std::str::Utf8Error>
+    {
+    }
+
+    /// Decoded and encoded this struct on the wire according to the bitcoin protocol.
+    pub trait Transcode<'a, IResultErrT: ParseError<'a>> {
+        /// Attempt to deserialize this struct.
+        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT>
+        where
+            Self: Sized;
+        /// The length of this struct when serialized.
+        fn deparsed_len(&self) -> usize;
+        /// Deserialise this struct.
+        /// # Panics
+        /// Implementations may panic if `output.len() < self.deparsed_len()`
+        fn deparse(&self, output: &mut [u8]);
+    }
+
+    trait TranscodeExt<'a, IResultErrT: ParseError<'a>>: Transcode<'a, IResultErrT> {
+        fn deparse_into_and_advance<'output>(
+            &self,
+            output: &'output mut [u8],
+        ) -> &'output mut [u8] {
+            self.deparse(output);
+            &mut output[self.deparsed_len()..]
+        }
+        fn deparse_to_vec(&self) -> Vec<u8> {
+            vec![0u8; self.deparsed_len()].tap_mut(|it| self.deparse(it))
+        }
+    }
+
+    impl<'a, IResultErrT: ParseError<'a>, T> TranscodeExt<'a, IResultErrT> for T where
+        T: Transcode<'a, IResultErrT>
+    {
+    }
+
+    impl<'a, IResultErrT: ParseError<'a>> Transcode<'a, IResultErrT> for bool {
+        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT> {
             use nom::bytes::streaming::tag;
             tag(&[0x00])
                 .value(false)
                 .or(tag(&[0x01]).value(true))
                 .parse(input)
         }
+
+        fn deparsed_len(&self) -> usize {
+            std::mem::size_of::<Self>()
+        }
+
+        fn deparse(&self, output: &mut [u8]) {
+            self.write_to_prefix(output)
+                .expect("attempted to deparse into a buffer too small for bool")
+        }
     }
 
-    impl Deparse<bool> for Transcoder {
-        fn deparsed_len(_: &bool) -> usize {
-            std::mem::size_of::<bool>()
-        }
-        fn deparse(out: &bool, buffer: &mut [u8]) {
-            <bool as zerocopy::AsBytes>::write_to_prefix(out, buffer)
-                .expect("Transcoder attempted to deparse into a buffer too small for bool")
-        }
-    }
-
-    impl<'a, IResultErrT> nom::Parser<&'a [u8], VarInt, IResultErrT> for Transcoder
-    where
-        IResultErrT: nom::error::ParseError<&'a [u8]>,
-    {
-        fn parse(&mut self, input: &'a [u8]) -> nom::IResult<&'a [u8], VarInt, IResultErrT> {
+    impl<'a, IResultErrT: ParseError<'a>> Transcode<'a, IResultErrT> for VarInt {
+        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT> {
             use nom::{
                 bytes::streaming::tag,
                 number::streaming::{le_u16, le_u32, le_u64, le_u8},
@@ -423,86 +444,136 @@ mod wire {
                 .or(le_u8.map(VarInt::from))
                 .parse(input)
         }
-    }
 
-    impl Deparse<VarInt> for Transcoder {
-        fn deparsed_len(out: &VarInt) -> usize {
+        fn deparsed_len(&self) -> usize {
             // a more direct translation of protocol documentation
             #[allow(clippy::match_overlapping_arm)]
-            match out.0 {
+            match self.0 {
                 ..=0xFE => 1,
                 ..=0xFFFF => 3,
                 ..=0xFFFF_FFFF => 5,
                 _ => 9,
             }
         }
-        fn deparse(out: &VarInt, buffer: &mut [u8]) {
-            match out.0 {
-                small @ ..=0xFE => buffer[0] = small as u8,
+        fn deparse(&self, output: &mut [u8]) {
+            if let None = match self.0 {
+                small @ ..=0xFE => {
+                    output[0] = small as u8;
+                    Some(())
+                }
                 medium @ ..=0xFFFF => {
-                    buffer[0] = 0xFD;
-                    U16le::new(medium as _).write_to_prefix(&mut buffer[1..]);
+                    output[0] = 0xFD;
+                    U16le::new(medium as _).write_to_prefix(&mut output[1..])
                 }
                 large @ ..=0xFFFF_FFFF => {
-                    buffer[0] = 0xFE;
-                    U32le::new(large as _).write_to_prefix(&mut buffer[1..]);
+                    output[0] = 0xFE;
+                    U32le::new(large as _).write_to_prefix(&mut output[1..])
                 }
                 xlarge => {
-                    buffer[0] = 0xFF;
-                    U64le::new(xlarge as _).write_to_prefix(&mut buffer[1..]);
+                    output[0] = 0xFF;
+                    U64le::new(xlarge as _).write_to_prefix(&mut output[1..])
                 }
+            } {
+                panic!("attempted to deparse into a buffer too small for VarInt")
             }
         }
     }
 
-    impl<'a, IResultErrT> nom::Parser<&'a [u8], VarStr<'a>, IResultErrT> for Transcoder
-    where
-        IResultErrT: nom::error::ParseError<&'a [u8]>
-            + nom::error::FromExternalError<&'a [u8], std::str::Utf8Error>,
-    {
-        fn parse(&mut self, input: &'a [u8]) -> nom::IResult<&'a [u8], VarStr<'a>, IResultErrT> {
-            let (rem, len) = Self::parser_for::<VarInt, _>().parse(input)?;
+    impl<'a, IResultErrT: ParseError<'a>> Transcode<'a, IResultErrT> for VarStr<'a> {
+        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], VarStr<'a>, IResultErrT> {
+            let (rem, len) = VarInt::parse(input)?;
             nom::bytes::streaming::take(len.0)
                 .map_res(std::str::from_utf8)
                 .map(VarStr)
                 .parse(rem)
         }
-    }
 
-    impl Transcoder {
-        /// Implementation detail of [transcode_each_field]
-        fn parser_for<'a, T, IResultErrT>() -> impl nom::Parser<&'a [u8], T, IResultErrT>
-        where
-            Self: nom::Parser<&'a [u8], T, IResultErrT>,
-        {
-            Self
+        fn deparsed_len(&self) -> usize {
+            <VarInt as Transcode<IResultErrT>>::deparsed_len(&self.len_var_int()) + self.0.len()
         }
-
-        fn deparse_into_and_advance<'buffer, OutT>(
-            out: &OutT,
-            buffer: &'buffer mut [u8],
-        ) -> &'buffer mut [u8]
-        where
-            Self: Deparse<OutT>,
-        {
-            Self::deparse(out, buffer);
-            &mut buffer[Self::deparsed_len(out)..]
+        fn deparse(&self, output: &mut [u8]) {
+            let output = <VarInt as TranscodeExt<IResultErrT>>::deparse_into_and_advance(
+                &self.len_var_int(),
+                output,
+            );
+            self.0.write_to_prefix(output).unwrap()
         }
     }
 
-    impl Deparse<VarStr<'_>> for Transcoder {
-        fn deparsed_len(out: &VarStr<'_>) -> usize {
-            <Self as Deparse<VarInt>>::deparsed_len(&out.len_var_int()) + out.0.len()
+    impl<'a, IResultErrT: ParseError<'a>> Transcode<'a, IResultErrT> for Version<'a> {
+        fn parse(input: &'a [u8]) -> nom::IResult<&'a [u8], Self, IResultErrT> {
+            nom::branch::alt((
+                VersionBasic::parse
+                    .verify(|v| v.fields_mandatory.version.get() < 106)
+                    .map(Self::Basic),
+                Version106::parse
+                    .verify(|v| v.fields_mandatory.version.get() < 70001)
+                    .map(Self::Supports106),
+                Version70001::parse.map(Self::Supports70001),
+            ))
+            .parse(input)
         }
-        fn deparse(out: &VarStr<'_>, buffer: &mut [u8]) {
-            let buffer = Self::deparse_into_and_advance(&out.len_var_int(), buffer);
-            out.0.write_to_prefix(buffer).unwrap()
+
+        fn deparsed_len(&self) -> usize {
+            match self {
+                Version::Basic(v) => <VersionBasic as Transcode<IResultErrT>>::deparsed_len(v),
+                Version::Supports106(v) => <Version106 as Transcode<IResultErrT>>::deparsed_len(v),
+                Version::Supports70001(v) => {
+                    <Version70001 as Transcode<IResultErrT>>::deparsed_len(v)
+                }
+            }
+        }
+
+        fn deparse(&self, output: &mut [u8]) {
+            match self {
+                Version::Basic(v) => <VersionBasic as Transcode<IResultErrT>>::deparse(v, output),
+                Version::Supports106(v) => {
+                    <Version106 as Transcode<IResultErrT>>::deparse(v, output)
+                }
+                Version::Supports70001(v) => {
+                    <Version70001 as Transcode<IResultErrT>>::deparse(v, output)
+                }
+            }
         }
     }
+
+    /// Transcode using [zerocopy::FromBytes]/[zerocopy::AsBytes]
+    macro_rules! transcode_primitive {
+        ($($ty:ty $({ $array_len:ident })?),* $(,)?) => {
+            $(
+                #[automatically_derived]
+                impl<'a, IResultErrT: ParseError<'a> $(, const $array_len: usize)?> Transcode<'a, IResultErrT> for $ty {
+                    fn parse(input: &'a [u8]) -> nom::IResult<&'a[u8], Self, IResultErrT> {
+                        match <$ty as zerocopy::FromBytes>::read_from_prefix(input) {
+                            Some(t) => Ok((&input[std::mem::size_of::<$ty>()..], t)),
+                            None => Err(nom::Err::Incomplete(nom::Needed::new(
+                                input.len() - std::mem::size_of::<$ty>(),
+                            ))),
+                        }
+                    }
+
+                    fn deparsed_len(&self) -> usize {
+                        std::mem::size_of::<$ty>()
+                    }
+
+                    fn deparse(&self, buffer: &mut [u8]) {
+                        <$ty as zerocopy::AsBytes>::write_to_prefix(self, buffer)
+                            .expect(concat!(
+                                "attempted to deparse into a buffer too small for ",
+                                stringify!($ty)
+                            ))
+                    }
+                }
+            )*
+        };
+    }
+
+    transcode_primitive!(U32le, U64le, U128netwk, U16netwk, I32le, I64le, [u8; N] { N });
 
     #[cfg(test)]
     mod transcoding {
         use nom::Parser;
+        use tap::Conv;
 
         use super::*;
         use std::fmt;
@@ -519,23 +590,23 @@ mod wire {
 
         fn do_test<'example, T>(example_bin: &'example [u8], expected: T)
         where
-            T: PartialEq + fmt::Debug,
-            Transcoder:
-                nom::Parser<&'example [u8], T, nom::error::Error<&'example [u8]>> + Deparse<T>,
+            T: PartialEq + fmt::Debug + Transcode<'example, nom::error::Error<&'example [u8]>>,
         {
             use pretty_assertions::assert_eq;
 
-            let (_, parsed_bin) = Transcoder.all_consuming().parse(example_bin).unwrap();
+            let (_, parsed_bin) = T::parse
+                .all_consuming()
+                .parse(example_bin)
+                .expect("failed to completely parse the example");
 
             assert_eq!(
                 expected, parsed_bin,
                 "the parsed example text doesn't match the expected struct"
             );
 
-            let mut unparsed_bin = vec![0u8; Transcoder::deparsed_len(&expected)];
-            Transcoder::deparse(&expected, &mut unparsed_bin);
             assert_eq!(
-                example_bin, unparsed_bin,
+                example_bin,
+                expected.deparse_to_vec(),
                 "the unparsed struct doesn't match the example bin"
             );
         }
@@ -565,6 +636,50 @@ mod wire {
                 VarStr("/Satoshi:0.7.2/"),
             );
             do_test(&[0x00], VarStr(""));
+        }
+
+        #[test]
+        fn version() {
+            do_test(
+                &hex2bin([
+                    "62 EA 00 00",             // - 60002 (protocol version 60002)
+                    "01 00 00 00 00 00 00 00", // - 1 (NODE_NETWORK services)
+                    "11 B2 D0 50 00 00 00 00", // - Tue Dec 18 10:12:33 PST 2012
+                    "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF 00 00 00 00 00 00", // - Recipient address info - see Network Address
+                    "01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 FF FF 00 00 00 00 00 00", // - Sender address info - see Network Address
+                    "3B 2E B3 5D 8C E6 17 65", // - Node ID
+                    "0F 2F 53 61 74 6F 73 68 69 3A 30 2E 37 2E 32 2F", // - "/Satoshi:0.7.2/" sub-version string (string is 15 bytes long)
+                    "C0 3E 03 00", // - Last block sending node has is block #212672
+                ]),
+                Version::Supports106(Version106 {
+                    fields_mandatory: VersionFieldsMandatory {
+                        version: 60002.into(),
+                        services: 1.into(),
+                        timestamp: 1355854353.into(),
+                        receiver: NetworkAddressWithoutTime {
+                            services: 1.into(),
+                            ipv6: std::net::Ipv4Addr::UNSPECIFIED
+                                .to_ipv6_mapped()
+                                .conv::<u128>()
+                                .into(),
+                            port: 0.into(),
+                        },
+                    },
+                    fields_106: VersionFields106 {
+                        sender: NetworkAddressWithoutTime {
+                            services: 1.into(),
+                            ipv6: std::net::Ipv4Addr::UNSPECIFIED
+                                .to_ipv6_mapped()
+                                .conv::<u128>()
+                                .into(),
+                            port: 0.into(),
+                        },
+                        nonce: 7284544412836900411.into(),
+                        user_agent: VarStr("/Satoshi:0.7.2/"),
+                        start_height: 212672.into(),
+                    },
+                }),
+            );
         }
     }
 }
