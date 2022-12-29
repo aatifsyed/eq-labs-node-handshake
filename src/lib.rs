@@ -164,6 +164,7 @@ impl tokio_util::codec::Decoder for Decoder {
         match command {
             Version => match wire::Version::parse::<nom::error::VerboseError<_>>
                 .all_consuming()
+                .complete()
                 .parse(&payload)
             {
                 Ok((_, version)) => Ok(Some(Message {
@@ -171,7 +172,7 @@ impl tokio_util::codec::Decoder for Decoder {
                     // Here is where we make the call to heap allocate - a high performance implementation could choose not to
                     body: MessageBody::Version(version.into_static()),
                 })),
-                Err(nom::Err::Incomplete(_)) => unreachable!("called all_consuming()"),
+                Err(nom::Err::Incomplete(_)) => unreachable!("called complete()"),
                 Err(nom::Err::Error(error)) => Err(DecoderError::PayloadParsingError {
                     command,
                     message: format!("{error:?}"),
