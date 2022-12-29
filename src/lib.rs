@@ -4,16 +4,22 @@ use std::{cmp, io, mem};
 
 use bitcoin_hashes::Hash as _;
 use bytes::Buf as _;
+use nom::Parser;
+use nom_supreme::ParserExt;
 use zerocopy::FromBytes as _;
 
+use crate::wire::Transcode as _;
+
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct Message {
     pub network: u32,
     pub body: MessageBody,
 }
 
+#[derive(Debug, Clone, PartialEq, Hash, enum_as_inner::EnumAsInner)]
 pub enum MessageBody {
     Verack,
-    Version,
+    Version(wire::Version<'static>),
 }
 
 pub struct Encoder {}
@@ -27,21 +33,42 @@ pub enum EncoderError {
 impl tokio_util::codec::Encoder<Message> for Encoder {
     type Error = EncoderError;
 
-    fn encode(&mut self, item: Message, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
-        todo!()
+    #[tracing::instrument(level = "debug", skip(self, output), ret, err)]
+    fn encode(&mut self, item: Message, output: &mut bytes::BytesMut) -> Result<(), Self::Error> {
+        let with_command = |command| wire::Header {
+            magic: item.network.into(),
+            command,
+            ..wire::Header::new_zeroed()
+        };
+        use crate::constants::commands::arr::{VERACK, VERSION};
+        match item.body {
+            MessageBody::Verack => wire::Frame {
+                header: with_command(VERACK),
+                body: (),
+            }
+            .deparse_valid_into(output),
+            MessageBody::Version(body) => wire::Frame {
+                header: with_command(VERSION),
+                body,
+            }
+            .deparse_valid_into(output),
+        }
+        Ok(())
     }
 }
 
 pub struct Decoder {
-    max_frame_length: Option<u32>,
+    /// Maximum frame length to allow.
+    /// Since [wire::VarStr]'s borrow from the input, this is implicitly an upper bound on heap allocations
+    pub max_frame_length: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecoderError {
-    #[error("error parsing payload for {command} frame")]
+    #[error("error parsing payload for {command} frame: {message}")]
     PayloadParsingError {
         command: crate::constants::commands::Command,
-        error: nom::error::VerboseError<Vec<u8>>,
+        message: String,
     },
     #[error("unexpected payload of length {payload_length} for {command} frame")]
     UnexpectedPayload {
@@ -66,6 +93,7 @@ impl tokio_util::codec::Decoder for Decoder {
 
     type Error = DecoderError;
 
+    #[tracing::instrument(level = "debug", skip(self, src), ret, err)]
     fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         // Read the header, or ask for more bytes
         let Some(header) = wire::Header::read_from_prefix(src.as_ref()) else {
@@ -110,12 +138,9 @@ impl tokio_util::codec::Decoder for Decoder {
         let payload = header_and_payload;
 
         // Check the checksum
-        let expected_checksum = match payload.is_empty() {
-            true => [0; 4],
-            false => {
-                let it = bitcoin_hashes::sha256d::Hash::hash(&payload).into_inner();
-                [it[0], it[1], it[2], it[3]]
-            }
+        let expected_checksum = {
+            let c = bitcoin_hashes::sha256d::Hash::hash(&payload).into_inner();
+            [c[0], c[1], c[2], c[3]]
         };
 
         if expected_checksum != header.checksum {
@@ -128,7 +153,25 @@ impl tokio_util::codec::Decoder for Decoder {
         // Decode the payload
         use crate::constants::commands::Command::{Verack, Version};
         match command {
-            Version => todo!(),
+            Version => match wire::Version::parse::<nom::error::VerboseError<_>>
+                .all_consuming()
+                .parse(&payload)
+            {
+                Ok((_, version)) => Ok(Some(Message {
+                    network: header.magic.get(),
+                    // Here is where we make the call to heap allocate - a high performance implementation could choose not to
+                    body: MessageBody::Version(version.into_static()),
+                })),
+                Err(nom::Err::Incomplete(_)) => unreachable!("called all_consuming()"),
+                Err(nom::Err::Error(error)) => Err(DecoderError::PayloadParsingError {
+                    command,
+                    message: format!("{error:?}"),
+                }),
+                Err(nom::Err::Failure(error)) => Err(DecoderError::PayloadParsingError {
+                    command,
+                    message: format!("{error:?}"),
+                }),
+            },
             Verack => match payload.is_empty() {
                 true => Ok(Some(Message {
                     network: header.magic.get(),
@@ -140,6 +183,44 @@ impl tokio_util::codec::Decoder for Decoder {
                 }),
             },
         }
+    }
+}
+
+/// Simple struct which unifies an encoder and decoder
+#[derive(Debug, Clone, Copy)]
+pub struct Codec<EncoderT, DecoderT> {
+    pub encoder: EncoderT,
+    pub decoder: DecoderT,
+}
+
+impl<EncoderT, DecoderT> Codec<EncoderT, DecoderT> {
+    pub fn new(encoder: EncoderT, decoder: DecoderT) -> Self {
+        Self { encoder, decoder }
+    }
+}
+
+impl<EncoderT, DecoderT, EncodeItemT> tokio_util::codec::Encoder<EncodeItemT>
+    for Codec<EncoderT, DecoderT>
+where
+    EncoderT: tokio_util::codec::Encoder<EncodeItemT>,
+{
+    type Error = EncoderT::Error;
+
+    fn encode(&mut self, item: EncodeItemT, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
+        self.encoder.encode(item, dst)
+    }
+}
+
+impl<EncoderT, DecoderT> tokio_util::codec::Decoder for Codec<EncoderT, DecoderT>
+where
+    DecoderT: tokio_util::codec::Decoder,
+{
+    type Item = DecoderT::Item;
+
+    type Error = DecoderT::Error;
+
+    fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        self.decoder.decode(src)
     }
 }
 
@@ -193,7 +274,7 @@ pub mod constants {
         commands!(VERSION / Version = "version", VERACK / Verack = "verack");
     }
 
-    #[derive(Debug, bitbag::BitBaggable, Clone, Copy, PartialEq, Eq, Hash)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, bitbag::BitBaggable, strum::EnumIter)]
     #[repr(u64)]
     pub enum Services {
         /// `NODE_NETWORK`

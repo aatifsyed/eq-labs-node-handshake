@@ -12,9 +12,12 @@
 //   - we could have safe "view structs" into owned buffers, but I'd only stoop to that in extreme
 //     performance environments
 
+use std::borrow::Cow;
+use std::net;
+
 use nom::Parser as _;
 use nom_supreme::ParserExt as _;
-use tap::{Tap, TryConv};
+use tap::{Conv as _, Tap as _, TryConv as _};
 use zerocopy::{
     little_endian::{I32 as I32le, I64 as I64le, U16 as U16le, U32 as U32le, U64 as U64le},
     network_endian::{U128 as U128netwk, U16 as U16netwk},
@@ -136,6 +139,24 @@ pub struct NetworkAddressWithoutTime {
     pub port: U16netwk,
 }}
 
+impl NetworkAddressWithoutTime {
+    pub fn new(services: u64, ip_address: net::IpAddr, port: u16) -> Self {
+        Self {
+            services: services.into(),
+            ipv6: match ip_address {
+                net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+                net::IpAddr::V6(v6) => v6,
+            }
+            .conv::<u128>()
+            .into(),
+            port: port.into(),
+        }
+    }
+    pub fn ip_addr(&self) -> net::Ipv6Addr {
+        self.ipv6.get().into()
+    }
+}
+
 transcode_each_field! {
 /// Fields present in all version packets
 // https://en.bitcoin.it/wiki/Protocol_documentation#version
@@ -168,6 +189,23 @@ pub struct VersionFields106<'a> {
     /// The last block received by the emitting node
     pub start_height: U32le,
 }}
+
+impl VersionFields106<'_> {
+    fn into_static(self) -> VersionFields106<'static> {
+        let Self {
+            sender,
+            nonce,
+            user_agent,
+            start_height,
+        } = self;
+        VersionFields106 {
+            sender,
+            nonce,
+            user_agent: user_agent.into_static(),
+            start_height,
+        }
+    }
+}
 
 transcode_each_field! {
 /// Fields present in all version packets at or after version 70001
@@ -233,7 +271,7 @@ impl<'a> Transcode<'a> for VarInt {
         }
     }
     fn deparse(&self, output: &mut [u8]) {
-        if let None = match self.0 {
+        if match self.0 {
             small @ ..=0xFE => {
                 output[0] = small as u8;
                 Some(())
@@ -250,7 +288,9 @@ impl<'a> Transcode<'a> for VarInt {
                 output[0] = 0xFF;
                 U64le::new(xlarge as _).write_to_prefix(&mut output[1..])
             }
-        } {
+        }
+        .is_none()
+        {
             panic!("attempted to deparse into a buffer too small for VarInt")
         }
     }
@@ -258,10 +298,26 @@ impl<'a> Transcode<'a> for VarInt {
 
 /// Variable length string can be stored using a variable length integer followed by the string itself.
 // https://en.bitcoin.it/wiki/Protocol_documentation#Variable_length_string
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VarStr<'a>(pub &'a str);
+// Putting a [Cow] in here is a little cheeky, but it allows us to use the same struct for protocol and business logic
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VarStr<'a>(pub Cow<'a, str>);
 
 impl VarStr<'_> {
+    pub fn borrowed(s: &str) -> VarStr<'_> {
+        VarStr(Cow::Borrowed(s))
+    }
+
+    pub fn owned(s: impl Into<String>) -> VarStr<'static> {
+        VarStr(Cow::Owned(s.into()))
+    }
+
+    pub fn into_static(self) -> VarStr<'static> {
+        match self.0 {
+            Cow::Borrowed(s) => VarStr(Cow::Owned(s.to_string())),
+            Cow::Owned(s) => VarStr(Cow::Owned(s)),
+        }
+    }
+
     /// # Panics
     /// If `self.0.len() > u64::MAX`
     pub fn len_var_int(&self) -> VarInt {
@@ -276,7 +332,7 @@ impl<'a> Transcode<'a> for VarStr<'a> {
         let (rem, len) = VarInt::parse(input)?;
         nom::bytes::streaming::take(len.0)
             .map_res(std::str::from_utf8)
-            .map(VarStr)
+            .map(VarStr::owned)
             .parse(rem)
     }
 
@@ -305,6 +361,19 @@ transcode_each_field! {
     }
 }
 
+impl Version106<'_> {
+    pub fn into_static(self) -> Version106<'static> {
+        let Self {
+            fields_mandatory,
+            fields_106,
+        } = self;
+        Version106 {
+            fields_mandatory,
+            fields_106: fields_106.into_static(),
+        }
+    }
+}
+
 transcode_each_field! {
     #[derive(Debug, Clone, PartialEq, Hash)]
     pub struct Version70001<'a> {
@@ -313,12 +382,36 @@ transcode_each_field! {
         pub fields_70001: VersionFields70001,
     }
 }
+impl Version70001<'_> {
+    pub fn into_static(self) -> Version70001<'static> {
+        let Self {
+            fields_mandatory,
+            fields_106,
+            fields_70001,
+        } = self;
+        Version70001 {
+            fields_mandatory,
+            fields_106: fields_106.into_static(),
+            fields_70001,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum Version<'a> {
     Basic(VersionBasic),
     Supports106(Version106<'a>),
     Supports70001(Version70001<'a>),
+}
+
+impl Version<'_> {
+    pub fn into_static(self) -> Version<'static> {
+        match self {
+            Version::Basic(v) => Version::Basic(v),
+            Version::Supports106(v) => Version::Supports106(v.into_static()),
+            Version::Supports70001(v) => Version::Supports70001(v.into_static()),
+        }
+    }
 }
 
 impl<'a> Transcode<'a> for Version<'a> {
@@ -418,6 +511,15 @@ where
         self.deparse_valid(&mut output);
         output
     }
+
+    /// Grows `output` to fit.
+    /// Sets checksum and length on self and in the buffer
+    /// # Panics
+    /// - if `self.body.deparsed_len() > u32::MAX`
+    pub(crate) fn deparse_valid_into(&mut self, output: &mut bytes::BytesMut) {
+        output.resize(self.deparsed_len(), 0);
+        self.deparse_valid(output)
+    }
 }
 
 ///////////////////////////////
@@ -495,7 +597,7 @@ impl<'a, T> ParseError<'a> for T where
 {
 }
 
-trait TranscodeExt<'a>: Transcode<'a> {
+pub(crate) trait TranscodeExt<'a>: Transcode<'a> {
     fn deparse_into_and_advance<'output>(&self, output: &'output mut [u8]) -> &'output mut [u8] {
         self.deparse(output);
         &mut output[self.deparsed_len()..]
@@ -509,10 +611,8 @@ impl<'a, T> TranscodeExt<'a> for T where T: Transcode<'a> {}
 
 #[cfg(test)]
 mod transcoding {
-    use nom::Parser;
-    use tap::Conv;
-
     use super::*;
+
     use std::fmt;
 
     fn hex2bin<'a>(hex: impl IntoIterator<Item = &'a str>) -> Vec<u8> {
@@ -570,9 +670,9 @@ mod transcoding {
     fn var_str() {
         do_test(
             &hex2bin(["0F 2F 53 61 74 6F 73 68 69 3A 30 2E 37 2E 32 2F"]),
-            VarStr("/Satoshi:0.7.2/"),
+            VarStr::owned("/Satoshi:0.7.2/"),
         );
-        do_test(&[0x00], VarStr(""));
+        do_test(&[0x00], VarStr::borrowed(""));
     }
 
     #[test]
@@ -612,7 +712,7 @@ mod transcoding {
                         port: 0.into(),
                     },
                     nonce: 7284544412836900411.into(),
-                    user_agent: VarStr("/Satoshi:0.7.2/"),
+                    user_agent: VarStr::borrowed("/Satoshi:0.7.2/"),
                     start_height: 212672.into(),
                 },
             }),
@@ -670,7 +770,7 @@ mod transcoding {
                             port: 0.into(),
                         },
                         nonce: 7284544412836900411.into(),
-                        user_agent: VarStr("/Satoshi:0.7.2/"),
+                        user_agent: VarStr::borrowed("/Satoshi:0.7.2/"),
                         start_height: 212672.into(),
                     },
                 },

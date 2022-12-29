@@ -1,7 +1,13 @@
-use std::io::{self};
+use std::{io, time};
 
 use clap::Parser as _;
+use color_eyre::eyre::{bail, eyre, Context, ContextCompat};
+use eq_labs_node_handshake::{
+    constants::Magic, wire, Codec, Decoder, Encoder, Message, MessageBody,
+};
+use futures::{SinkExt as _, StreamExt as _};
 use tracing::{debug, info};
+use zerocopy::FromBytes;
 
 #[derive(Debug, clap::Parser)]
 struct Cli {
@@ -33,25 +39,98 @@ async fn main() -> color_eyre::Result<()> {
         Subcommand::DoHandshake { destination } => {
             info!(%destination, "performing handshake");
 
-            // let (socket_receiver, mut socket_sender) = tokio::net::TcpStream::connect(destination)
-            //     .await
-            //     .wrap_err("couldn't connect to destination")?
-            //     .into_split();
-            // let mut socket_receiver =
-            //     tokio::io::BufReader::with_capacity(MAX_PACKET_SIZE, socket_receiver);
-            // let mut send_buffer = Vec::new();
+            let socket = tokio::net::TcpStream::connect(destination)
+                .await
+                .wrap_err("couldn't connect to destination")?;
 
-            // let our_version = create_version_message(destination);
-            // send_message(&mut send_buffer, &our_version, &mut socket_sender)
-            //     .await
-            //     .wrap_err("couldn't send version message")?;
-            // info!(?our_version, "sent version message");
+            let mut transport = tokio_util::codec::Framed::new(
+                socket,
+                Codec::new(
+                    Encoder {},
+                    Decoder {
+                        max_frame_length: None,
+                    },
+                ),
+            );
 
-            // let mut buf = [0; 1000];
-            // socket.read(&mut buf).wrap_err("couldn't read verack")?;
-            // let (_, message) = Message::parse(&buf[..]).unwrap();
-            // println!("{message:?}");
+            // https://en.bitcoin.it/wiki/Version_Handshake
+
+            transport
+                .send(Message {
+                    network: Magic::Main as _,
+                    body: MessageBody::Version(wire::Version::Supports106(wire::Version106 {
+                        fields_mandatory: wire::VersionFieldsMandatory {
+                            version: 70000.into(),
+                            services: 0.into(),
+                            timestamp: current_unix_secs().into(),
+                            receiver: wire::NetworkAddressWithoutTime::new(
+                                0,
+                                destination.ip(),
+                                destination.port(),
+                            ),
+                        },
+                        fields_106: wire::VersionFields106 {
+                            sender: wire::NetworkAddressWithoutTime::new_zeroed(),
+                            nonce: 0.into(),
+                            user_agent: wire::VarStr::borrowed("me!"),
+                            start_height: 0.into(),
+                        },
+                    })),
+                })
+                .await
+                .wrap_err("couldn't send version advertisement")?;
+
+            info!("sent advertisement");
+
+            let message = transport
+                .next()
+                .await
+                .wrap_err("transport closed before version advertisement received")?
+                .wrap_err("peer sent invalid version advertisement message")?;
+
+            let version = message
+                .body
+                .into_version()
+                .map_err(|actual| eyre!("expected version advertisement, got {actual:?}"))?;
+
+            info!(
+                network = message.network,
+                ?version,
+                "received advertisement"
+            );
+
+            transport
+                .send(Message {
+                    network: Magic::Main as _,
+                    body: MessageBody::Verack,
+                })
+                .await
+                .wrap_err("couldn't send verack")?;
+
+            info!("sent verack");
+
+            let message = transport
+                .next()
+                .await
+                .wrap_err("transport closed bofer verack received")?
+                .wrap_err("peer sent invalid verack")?;
+
+            if !message.body.is_verack() {
+                bail!("expected verack, got {:?}", message.body)
+            }
+
+            info!(network = message.network, "received verack");
+            info!("handshake complete!");
             Ok(())
         }
     }
+}
+
+fn current_unix_secs() -> i64 {
+    time::SystemTime::now()
+        .duration_since(time::SystemTime::UNIX_EPOCH)
+        .expect("too far in the past!")
+        .as_secs()
+        .try_into()
+        .expect("time is too big!")
 }
