@@ -4,6 +4,7 @@ use std::{cmp, io, mem};
 
 use bitcoin_hashes::Hash as _;
 use bytes::Buf as _;
+use custom_debug_derive::Debug;
 use nom::Parser;
 use nom_supreme::ParserExt;
 use zerocopy::FromBytes as _;
@@ -12,6 +13,7 @@ use crate::wire::Transcode as _;
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct Message {
+    #[debug(with = "wire::magic")]
     pub network: u32,
     pub body: MessageBody,
 }

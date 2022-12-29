@@ -14,6 +14,7 @@
 
 use std::{borrow::Cow, fmt, net};
 
+use custom_debug_derive::Debug;
 use nom::Parser as _;
 use nom_supreme::ParserExt as _;
 use tap::{Conv as _, Tap as _, TryConv as _};
@@ -42,14 +43,13 @@ pub trait Transcode<'a> {
 }
 
 // bargain bucket derive macro
-macro_rules! transcode_and_display_each_field {
+macro_rules! transcode_each_field {
     // Capture struct definition
     (
         $(#[$struct_meta:meta])*
         $struct_vis:vis struct $struct_name:ident$(<$struct_lifetime:lifetime>)? {
             $(
                 $(#[$field_meta:meta])*
-                $(@display($field_display_override:path))?
                 $field_vis:vis $field_name:ident: $field_ty:ty,
             )*
         }
@@ -101,23 +101,6 @@ macro_rules! transcode_and_display_each_field {
                 let _ = output;
             }
         }
-
-        #[automatically_derived]
-        impl$(<$struct_lifetime>)? fmt::Display for $struct_name$(<$struct_lifetime>)? {
-            #[allow(unreachable_patterns)]
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.debug_struct(stringify!($struct_name))
-                    $(
-                        .field(stringify!($field_name), &match &self.$field_name {
-                            $(
-                                _ => format!("{:?}", $field_display_override(&self.$field_name)),
-                            )?
-                            _ => format!("{:?}", &self.$field_name),
-                        })
-                    )*
-                    .finish()
-            }
-        }
     };
 }
 
@@ -125,17 +108,17 @@ macro_rules! transcode_and_display_each_field {
 // Structs transcribed from https://en.bitcoin.it/wiki/Protocol_documentation //
 ////////////////////////////////////////////////////////////////////////////////
 
-transcode_and_display_each_field! {
+transcode_each_field! {
 /// Message header for all bitcoin protocol packets
 // https://en.bitcoin.it/wiki/Protocol_documentation#Message_structure
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::AsBytes, zerocopy::FromBytes)]
 #[repr(C)]
 pub struct Header {
     /// Magic value indicating message origin network, and used to seek to next message when stream state is unknown
-    @display(magic)
+    #[debug(with = "magic")]
     pub magic: U32le,
     /// ASCII string identifying the packet content, NULL padded (non-NULL padding results in packet rejected)
-    @display(command)
+    #[debug(with = "command")]
     pub command: [u8; 12],
     /// Length of payload in number of bytes
     pub length: U32le,
@@ -143,44 +126,18 @@ pub struct Header {
     pub checksum: [u8; 4],
 }}
 
-fn forward(t: &(impl fmt::Display + Clone)) -> impl fmt::Debug {
-    DebugWithDisplay(t.clone())
-}
-
-fn magic(u: &U32le) -> impl fmt::Debug {
-    match crate::constants::Magic::try_from(u.get()) {
-        Ok(known) => known.to_string(),
-        Err(_) => u.to_string(),
-    }
-}
-
-fn command(c: &[u8; 12]) -> impl fmt::Debug {
-    match crate::constants::commands::Command::try_from(*c) {
-        Ok(known) => known.to_string(),
-        Err(_) => String::from_utf8_lossy(c).into_owned(),
-    }
-}
-
-fn services(u: &U64le) -> impl fmt::Debug {
-    bitbag::BitBag::<crate::constants::Services>::new_unchecked(u.get())
-}
-
-fn ipv6(u: &U128netwk) -> impl fmt::Debug {
-    net::Ipv6Addr::from(u.get())
-}
-
-transcode_and_display_each_field! {
+transcode_each_field! {
 /// When a network address is needed somewhere, this structure is used. Network addresses are not prefixed with a timestamp in the version message.
 // https://en.bitcoin.it/wiki/Protocol_documentation#Network_address
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::AsBytes, zerocopy::FromBytes)]
 #[repr(C)]
 pub struct NetworkAddressWithoutTime {
     /// same service(s) listed in version.
-    @display(services)
+    #[debug(with = "services")]
     pub services: U64le,
     /// IPv6 address. Network byte order. The original client only supported IPv4 and only read the last 4 bytes to get the IPv4 address. However, the IPv4 address is written into the message as a 16 byte IPv4-mapped IPv6 address
     /// (12 bytes 00 00 00 00 00 00 00 00 00 00 FF FF, followed by the 4 bytes of the IPv4 address).
-    @display(ipv6)
+    #[debug(with = "ipv6")]
     pub ipv6: U128netwk,
     /// port number, network byte order
     pub port: U16netwk,
@@ -204,7 +161,7 @@ impl NetworkAddressWithoutTime {
     }
 }
 
-transcode_and_display_each_field! {
+transcode_each_field! {
 /// Fields present in all version packets
 // https://en.bitcoin.it/wiki/Protocol_documentation#version
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::AsBytes, zerocopy::FromBytes)]
@@ -213,16 +170,16 @@ pub struct VersionFieldsMandatory {
     /// Identifies protocol version being used by the node
     pub version: I32le,
     /// Bitfield of features to be enabled for this connection.
-    @display(services)
+    #[debug(with = "services")]
     pub services: U64le,
     /// Standard UNIX timestamp in seconds.
+    #[debug(with = "timestamp")]
     pub timestamp: I64le,
     /// The network address of the node receiving this message.
-    @display(forward)
     pub receiver: NetworkAddressWithoutTime,
 }}
 
-transcode_and_display_each_field! {
+transcode_each_field! {
 /// Fields present in all version packets at or after version 106
 // https://en.bitcoin.it/wiki/Protocol_documentation#version
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -256,7 +213,7 @@ impl VersionFields106<'_> {
     }
 }
 
-transcode_and_display_each_field! {
+transcode_each_field! {
 /// Fields present in all version packets at or after version 70001
 // https://en.bitcoin.it/wiki/Protocol_documentation#version
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::AsBytes)]
@@ -394,7 +351,7 @@ impl<'a> Transcode<'a> for VarStr<'a> {
     }
 }
 
-transcode_and_display_each_field! {
+transcode_each_field! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::AsBytes, zerocopy::FromBytes)]
     #[repr(C)]
     pub struct VersionBasic {
@@ -402,7 +359,7 @@ transcode_and_display_each_field! {
     }
 }
 
-transcode_and_display_each_field! {
+transcode_each_field! {
     #[derive(Debug, Clone, PartialEq, Hash)]
     pub struct Version106<'a> {
         pub fields_mandatory: VersionFieldsMandatory,
@@ -423,7 +380,7 @@ impl Version106<'_> {
     }
 }
 
-transcode_and_display_each_field! {
+transcode_each_field! {
     #[derive(Debug, Clone, PartialEq, Hash)]
     pub struct Version70001<'a> {
         pub fields_mandatory: VersionFieldsMandatory,
@@ -646,17 +603,6 @@ impl<'a, T> ParseError<'a> for T where
 {
 }
 
-struct DebugWithDisplay<T>(T);
-
-impl<T> fmt::Debug for DebugWithDisplay<T>
-where
-    T: fmt::Display,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_fmt(format_args!("{}", self.0))
-    }
-}
-
 pub(crate) trait TranscodeExt<'a>: Transcode<'a> {
     fn deparse_into_and_advance<'output>(&self, output: &'output mut [u8]) -> &'output mut [u8] {
         self.deparse(output);
@@ -668,6 +614,46 @@ pub(crate) trait TranscodeExt<'a>: Transcode<'a> {
 }
 
 impl<'a, T> TranscodeExt<'a> for T where T: Transcode<'a> {}
+
+////////////////////////
+// Formatting helpers //
+////////////////////////
+
+pub(crate) fn magic(u: &(impl Clone + Into<u32>), f: &mut fmt::Formatter) -> fmt::Result {
+    let u = u.clone().into();
+    match crate::constants::Magic::try_from(u) {
+        Ok(known) => f.write_fmt(format_args!("{known:?}")),
+        Err(_) => f.write_fmt(format_args!("{u:?}")),
+    }
+}
+
+fn command(c: &[u8; 12], f: &mut fmt::Formatter) -> fmt::Result {
+    match crate::constants::commands::Command::try_from(*c) {
+        Ok(known) => f.write_fmt(format_args!("{known:?}")),
+        Err(_) => {
+            f.write_str(&String::from_utf8_lossy(c))?;
+            f.write_fmt(format_args!(" ({c:?})"))
+        }
+    }
+}
+
+fn ipv6(c: &U128netwk, f: &mut fmt::Formatter) -> fmt::Result {
+    f.write_fmt(format_args!("{:?}", c.get().conv::<net::Ipv6Addr>()))
+}
+
+fn services(u: &U64le, f: &mut fmt::Formatter) -> fmt::Result {
+    f.write_fmt(format_args!(
+        "{}",
+        bitbag::BitBag::<crate::constants::Services>::new_unchecked(u.get())
+    ))
+}
+
+fn timestamp(t: &I64le, f: &mut fmt::Formatter) -> fmt::Result {
+    match chrono::NaiveDateTime::from_timestamp_opt(t.get(), 0) {
+        Some(dt) => f.write_fmt(format_args!("{dt}")),
+        None => f.write_fmt(format_args!("{t} seconds")),
+    }
+}
 
 #[cfg(test)]
 mod transcoding {
