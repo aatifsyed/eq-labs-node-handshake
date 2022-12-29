@@ -5,7 +5,7 @@
 // https://en.bitcoin.it/wiki/Protocol_documentation#Common_structures
 //
 // Goals for this module are
-// - be fairly direct translations of the bitcoin documentations
+// - be fairly direct translations of the bitcoin documentation
 // - minimise the number of manual implementations, while still being correct
 // - allow zero-copy borrows from the source data
 //   - we achieve this with &strs, but not other structs
@@ -26,7 +26,9 @@ use zerocopy::{
 
 /// Decode and encode this struct on the wire according to the bitcoin protocol.
 /// This is for bit interpretation and *not* validation, as far as possible.
-// Generic over lifetime so we can impl for borrowed data
+// Generic over lifetime so we can impl for borrowed data.
+// Previous implementations had this as two separate traits, or had a separate Transcoder,
+// where config like max string length could be stored.
 pub trait Transcode<'a> {
     /// Attempt to deserialize this struct.
     fn parse<IResultErrT: ParseError<'a>>(
@@ -880,7 +882,7 @@ mod transcoding {
                 header: Header {
                     magic: crate::constants::Magic::Main.conv::<u32>().into(),
                     command: crate::constants::commands::arr::VERACK,
-                    length: 0.into(),
+                    length: 1.into(),
                     checksum: [0; 4]
                 },
                 body: ()

@@ -1,5 +1,5 @@
 [package]
-name = "eq-labs-node-handshake"
+name = "bitcoin-protocol"
 version = "0.1.0"
 edition = "2021"
 
@@ -17,6 +17,7 @@ custom_debug_derive = "0.5.0"
 derive_more = "0.99.17"
 enum-as-inner = "0.5.1"
 futures = "0.3.25"
+humantime = "2.1.0"
 nom = "7.1.1"
 nom-supreme = "0.8.0"
 num = "0.4.0"
@@ -32,6 +33,7 @@ tokio = { version = "1.23.0", features = [
     "rt",
     "rt-multi-thread",
     "macros",
+    "time",
 ] }
 tokio-util = { version = "0.7.4", features = ["codec"] }
 tracing = "0.1.37"

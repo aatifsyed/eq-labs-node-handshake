@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -o nounset -o xtrace
+
+trap exit INT
+
+readarray -t ips < <(
+    dig +noall +answer seed.bitcoinstats.com | awk '{ print $5 }'
+)
+
+cargo build
+
+for ip in "${ips[@]}"
+do
+    RUST_LOG=debug cargo run --quiet -- do-handshake "$ip:${port:-8333}" --timeout "2 seconds"
+done

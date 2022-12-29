@@ -1,3 +1,10 @@
+//! This library implements some messages for the bitcoin protocol.
+//! The key module is [wire], which contains the struct definitions and parsers for the protocol.
+//!
+//! The root [Message] is the "business logic" structure, which is currently just a thin wrapper around
+//! the wire structs. See [the commit history](https://github.com/aatifsyed/eq-labs-node-handshake/blob/5dc1b57c3c4e955920b9586898607a4f5b3f0ac0/src/lib.rs#L351)
+//! for previous approaches to this.
+
 pub mod wire;
 
 use std::{cmp, io, mem};
@@ -314,7 +321,7 @@ pub mod constants {
 
     #[cfg(test)]
     #[test]
-    fn services_non_overapping() {
+    fn services_non_overlapping() {
         bitbag::BitBag::<Services>::check_nonoverlapping().unwrap()
     }
 
