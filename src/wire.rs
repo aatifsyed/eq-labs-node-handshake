@@ -12,8 +12,7 @@
 //   - we could have safe "view structs" into owned buffers, but I'd only stoop to that in extreme
 //     performance environments
 
-use std::borrow::Cow;
-use std::net;
+use std::{borrow::Cow, fmt, net};
 
 use nom::Parser as _;
 use nom_supreme::ParserExt as _;
@@ -21,7 +20,7 @@ use tap::{Conv as _, Tap as _, TryConv as _};
 use zerocopy::{
     little_endian::{I32 as I32le, I64 as I64le, U16 as U16le, U32 as U32le, U64 as U64le},
     network_endian::{U128 as U128netwk, U16 as U16netwk},
-    AsBytes,
+    AsBytes as _,
 };
 
 /// Decode and encode this struct on the wire according to the bitcoin protocol.
@@ -43,13 +42,14 @@ pub trait Transcode<'a> {
 }
 
 // bargain bucket derive macro
-macro_rules! transcode_each_field {
+macro_rules! transcode_and_display_each_field {
     // Capture struct definition
     (
         $(#[$struct_meta:meta])*
         $struct_vis:vis struct $struct_name:ident$(<$struct_lifetime:lifetime>)? {
             $(
                 $(#[$field_meta:meta])*
+                $(@display($field_display_override:path))?
                 $field_vis:vis $field_name:ident: $field_ty:ty,
             )*
         }
@@ -101,6 +101,23 @@ macro_rules! transcode_each_field {
                 let _ = output;
             }
         }
+
+        #[automatically_derived]
+        impl$(<$struct_lifetime>)? fmt::Display for $struct_name$(<$struct_lifetime>)? {
+            #[allow(unreachable_patterns)]
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct(stringify!($struct_name))
+                    $(
+                        .field(stringify!($field_name), &match &self.$field_name {
+                            $(
+                                _ => format!("{:?}", $field_display_override(&self.$field_name)),
+                            )?
+                            _ => format!("{:?}", &self.$field_name),
+                        })
+                    )*
+                    .finish()
+            }
+        }
     };
 }
 
@@ -108,15 +125,17 @@ macro_rules! transcode_each_field {
 // Structs transcribed from https://en.bitcoin.it/wiki/Protocol_documentation //
 ////////////////////////////////////////////////////////////////////////////////
 
-transcode_each_field! {
+transcode_and_display_each_field! {
 /// Message header for all bitcoin protocol packets
 // https://en.bitcoin.it/wiki/Protocol_documentation#Message_structure
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::AsBytes, zerocopy::FromBytes)]
 #[repr(C)]
 pub struct Header {
     /// Magic value indicating message origin network, and used to seek to next message when stream state is unknown
+    @display(magic)
     pub magic: U32le,
     /// ASCII string identifying the packet content, NULL padded (non-NULL padding results in packet rejected)
+    @display(command)
     pub command: [u8; 12],
     /// Length of payload in number of bytes
     pub length: U32le,
@@ -124,16 +143,44 @@ pub struct Header {
     pub checksum: [u8; 4],
 }}
 
-transcode_each_field! {
+fn forward(t: &(impl fmt::Display + Clone)) -> impl fmt::Debug {
+    DebugWithDisplay(t.clone())
+}
+
+fn magic(u: &U32le) -> impl fmt::Debug {
+    match crate::constants::Magic::try_from(u.get()) {
+        Ok(known) => known.to_string(),
+        Err(_) => u.to_string(),
+    }
+}
+
+fn command(c: &[u8; 12]) -> impl fmt::Debug {
+    match crate::constants::commands::Command::try_from(*c) {
+        Ok(known) => known.to_string(),
+        Err(_) => String::from_utf8_lossy(c).into_owned(),
+    }
+}
+
+fn services(u: &U64le) -> impl fmt::Debug {
+    bitbag::BitBag::<crate::constants::Services>::new_unchecked(u.get())
+}
+
+fn ipv6(u: &U128netwk) -> impl fmt::Debug {
+    net::Ipv6Addr::from(u.get())
+}
+
+transcode_and_display_each_field! {
 /// When a network address is needed somewhere, this structure is used. Network addresses are not prefixed with a timestamp in the version message.
 // https://en.bitcoin.it/wiki/Protocol_documentation#Network_address
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::AsBytes, zerocopy::FromBytes)]
 #[repr(C)]
 pub struct NetworkAddressWithoutTime {
     /// same service(s) listed in version.
+    @display(services)
     pub services: U64le,
     /// IPv6 address. Network byte order. The original client only supported IPv4 and only read the last 4 bytes to get the IPv4 address. However, the IPv4 address is written into the message as a 16 byte IPv4-mapped IPv6 address
     /// (12 bytes 00 00 00 00 00 00 00 00 00 00 FF FF, followed by the 4 bytes of the IPv4 address).
+    @display(ipv6)
     pub ipv6: U128netwk,
     /// port number, network byte order
     pub port: U16netwk,
@@ -157,7 +204,7 @@ impl NetworkAddressWithoutTime {
     }
 }
 
-transcode_each_field! {
+transcode_and_display_each_field! {
 /// Fields present in all version packets
 // https://en.bitcoin.it/wiki/Protocol_documentation#version
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::AsBytes, zerocopy::FromBytes)]
@@ -166,14 +213,16 @@ pub struct VersionFieldsMandatory {
     /// Identifies protocol version being used by the node
     pub version: I32le,
     /// Bitfield of features to be enabled for this connection.
+    @display(services)
     pub services: U64le,
     /// Standard UNIX timestamp in seconds.
     pub timestamp: I64le,
     /// The network address of the node receiving this message.
+    @display(forward)
     pub receiver: NetworkAddressWithoutTime,
 }}
 
-transcode_each_field! {
+transcode_and_display_each_field! {
 /// Fields present in all version packets at or after version 106
 // https://en.bitcoin.it/wiki/Protocol_documentation#version
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -207,7 +256,7 @@ impl VersionFields106<'_> {
     }
 }
 
-transcode_each_field! {
+transcode_and_display_each_field! {
 /// Fields present in all version packets at or after version 70001
 // https://en.bitcoin.it/wiki/Protocol_documentation#version
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::AsBytes)]
@@ -225,7 +274,7 @@ pub struct VersionFields70001 {
 /// Variable length integers always precede an array/vector of a type of data that may vary in length.
 /// Longer numbers are encoded in little endian.
 // https://en.bitcoin.it/wiki/Protocol_documentation#Variable_length_integer
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
 pub struct VarInt(pub u64);
 
 impl<T> From<T> for VarInt
@@ -299,7 +348,7 @@ impl<'a> Transcode<'a> for VarInt {
 /// Variable length string can be stored using a variable length integer followed by the string itself.
 // https://en.bitcoin.it/wiki/Protocol_documentation#Variable_length_string
 // Putting a [Cow] in here is a little cheeky, but it allows us to use the same struct for protocol and business logic
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, derive_more::Display)]
 pub struct VarStr<'a>(pub Cow<'a, str>);
 
 impl VarStr<'_> {
@@ -345,7 +394,7 @@ impl<'a> Transcode<'a> for VarStr<'a> {
     }
 }
 
-transcode_each_field! {
+transcode_and_display_each_field! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, zerocopy::AsBytes, zerocopy::FromBytes)]
     #[repr(C)]
     pub struct VersionBasic {
@@ -353,7 +402,7 @@ transcode_each_field! {
     }
 }
 
-transcode_each_field! {
+transcode_and_display_each_field! {
     #[derive(Debug, Clone, PartialEq, Hash)]
     pub struct Version106<'a> {
         pub fields_mandatory: VersionFieldsMandatory,
@@ -374,7 +423,7 @@ impl Version106<'_> {
     }
 }
 
-transcode_each_field! {
+transcode_and_display_each_field! {
     #[derive(Debug, Clone, PartialEq, Hash)]
     pub struct Version70001<'a> {
         pub fields_mandatory: VersionFieldsMandatory,
@@ -595,6 +644,17 @@ impl<'a, T> ParseError<'a> for T where
     T: nom::error::ParseError<&'a [u8]>
         + nom::error::FromExternalError<&'a [u8], std::str::Utf8Error>
 {
+}
+
+struct DebugWithDisplay<T>(T);
+
+impl<T> fmt::Debug for DebugWithDisplay<T>
+where
+    T: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_fmt(format_args!("{}", self.0))
+    }
 }
 
 pub(crate) trait TranscodeExt<'a>: Transcode<'a> {

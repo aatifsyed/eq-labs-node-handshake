@@ -274,7 +274,17 @@ pub mod constants {
         commands!(VERSION / Version = "version", VERACK / Verack = "verack");
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, bitbag::BitBaggable, strum::EnumIter)]
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        Hash,
+        bitbag::BitBaggable,
+        strum::EnumIter,
+        strum::Display,
+    )]
     #[repr(u64)]
     pub enum Services {
         /// `NODE_NETWORK`
@@ -300,8 +310,22 @@ pub mod constants {
         NodeNetworkLimited = 1024,
     }
 
+    #[cfg(test)]
+    #[test]
+    fn services_non_overapping() {
+        bitbag::BitBag::<Services>::check_nonoverlapping().unwrap()
+    }
+
     #[derive(
-        Debug, Clone, Copy, PartialEq, Eq, Hash, num_enum::TryFromPrimitive, num_enum::IntoPrimitive,
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        Hash,
+        num_enum::TryFromPrimitive,
+        num_enum::IntoPrimitive,
+        strum::Display,
     )]
     #[repr(u32)]
     pub enum Magic {
